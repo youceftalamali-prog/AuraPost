@@ -1,0 +1,6 @@
+{
+  "name": "AuraPost AI",
+  "description": "The real AuraPost AI SaaS platform dashboard featuring product ingestion, AI-driven opportunity analysis, marketing studio, analytics, and e-commerce store synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
