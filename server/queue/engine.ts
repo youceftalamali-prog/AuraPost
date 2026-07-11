@@ -48,8 +48,11 @@ export class QueueEngine {
   private cleanupInFlight = false;
   private readonly workerState = new Map<QueueWorkerName, WorkerRuntimeState>();
 
-  constructor(private readonly db: DatabaseManager) {
-    this.db.getQueueWorkers().forEach((worker) => {
+  constructor(private readonly db: DatabaseManager) {}
+
+  private async hydrateWorkerState(): Promise<void> {
+    const workers = await this.db.getQueueWorkers();
+    workers.forEach((worker) => {
       this.workerState.set(worker.workerName, {
         processedJobs: worker.processedJobs,
         failedJobs: worker.failedJobs,
@@ -58,12 +61,13 @@ export class QueueEngine {
     });
   }
 
-  public start(): void {
+  public async start(): Promise<void> {
     if (this.running) {
       return;
     }
+    await this.hydrateWorkerState();
     this.running = true;
-    this.seedWorkerHeartbeats();
+    await this.seedWorkerHeartbeats();
     this.timers.push(setInterval(() => void this.runTick(), 1000));
     this.timers.push(setInterval(() => void this.runCleanup(), 5 * 60 * 1000));
   }
@@ -74,33 +78,34 @@ export class QueueEngine {
     this.timers = [];
   }
 
-  public getOverview(workspaceId?: string): QueueOverview {
-    return this.db.getQueueOverview(workspaceId);
+  public async getOverview(workspaceId?: string): Promise<QueueOverview> {
+    return await this.db.getQueueOverview(workspaceId);
   }
 
-  private seedWorkerHeartbeats(): void {
-    (Object.keys(WORKER_KINDS) as QueueWorkerName[]).forEach((workerName) => {
-      this.persistWorker(workerName, {
+  private async seedWorkerHeartbeats(): Promise<void> {
+    for (const workerName of Object.keys(WORKER_KINDS) as QueueWorkerName[]) {
+      await this.persistWorker(workerName, {
         status: "idle",
       });
-    });
+    }
   }
 
-  private persistWorker(
+  private async persistWorker(
     workerName: QueueWorkerName,
     patch: Partial<Omit<WorkerHealthSnapshot, "workerName" | "lastHeartbeatAt">> & { status: WorkerHealthSnapshot["status"] }
-  ): void {
+  ): Promise<void> {
     const state = this.workerState.get(workerName) || {
       processedJobs: 0,
       failedJobs: 0,
       averageProcessingTimeMs: 0,
     };
-    const queueLength = this.db.getQueueJobs(undefined, {
+    const matchingJobs = await this.db.getQueueJobs(undefined, {
       statuses: ["pending", "queued", "retrying"],
       kinds: WORKER_KINDS[workerName],
       includeCompleted: true,
-    }).length;
-    this.db.heartbeatWorker(workerName, {
+    });
+    const queueLength = matchingJobs.length;
+    await this.db.heartbeatWorker(workerName, {
       status: patch.status,
       activeJobId: patch.activeJobId,
       memoryUsageMb: Math.round((process.memoryUsage().rss / 1024 / 1024) * 100) / 100,
@@ -133,7 +138,7 @@ export class QueueEngine {
     }
     this.cleanupInFlight = true;
     try {
-      this.db.cleanupQueueRecords(
+      await this.db.cleanupQueueRecords(
         RETENTION_POLICY.completedHours,
         RETENTION_POLICY.failedHours,
         RETENTION_POLICY.logsHours
@@ -144,13 +149,14 @@ export class QueueEngine {
   }
 
   private async scheduleRecurringJobs(): Promise<void> {
-    const activeReferenceJobs = this.db.getQueueJobs(undefined, {
+    const activeReferenceJobs = await this.db.getQueueJobs(undefined, {
       statuses: ["pending", "queued", "retrying", "processing"],
       includeCompleted: true,
     });
 
-    for (const workspace of this.db.getAllWorkspaces()) {
-      const scheduledPosts = this.db.getSocialPosts(workspace.id, { includeAll: true }).filter((post) =>
+    for (const workspace of await this.db.getAllWorkspaces()) {
+      const allSocialPosts = await this.db.getSocialPosts(workspace.id, { includeAll: true });
+      const scheduledPosts = allSocialPosts.filter((post) =>
         post.status === "scheduled"
         && post.scheduledAt
         && new Date(post.scheduledAt).getTime() <= Date.now()
@@ -162,7 +168,7 @@ export class QueueEngine {
           && job.referenceId === post.id
         );
         if (!existing) {
-          this.db.enqueueQueueJob(workspace.id, {
+          await this.db.enqueueQueueJob(workspace.id, {
             kind: "social_publishing",
             workerName: "publishing-worker",
             referenceId: post.id,
@@ -177,8 +183,10 @@ export class QueueEngine {
         }
       }
 
-      for (const store of this.db.getShopifyStores(workspace.id).filter((item) => item.status === "connected")) {
-        const settings = this.db.getShopifyAutomationSettings(workspace.id, store.id);
+      const allStores = await this.db.getShopifyStores(workspace.id);
+      const connectedStores = allStores.filter((item) => item.status === "connected");
+      for (const store of connectedStores) {
+        const settings = await this.db.getShopifyAutomationSettings(workspace.id, store.id);
         if (!settings?.autoSyncEveryHour) {
           continue;
         }
@@ -194,10 +202,10 @@ export class QueueEngine {
         if (existing) {
           continue;
         }
-        this.db.saveShopifyAutomationSettings(workspace.id, store.id, {
+        await this.db.saveShopifyAutomationSettings(workspace.id, store.id, {
           lastAutoSyncAt: new Date().toISOString(),
         });
-        this.db.enqueueQueueJob(workspace.id, {
+        await this.db.enqueueQueueJob(workspace.id, {
           kind: "automation_execution",
           workerName: "automation-worker",
           referenceId: `auto-sync:${store.id}`,
@@ -216,28 +224,28 @@ export class QueueEngine {
   }
 
   private async processWorker(workerName: QueueWorkerName): Promise<void> {
-    const job = this.db.claimNextQueueJob(workerName, WORKER_KINDS[workerName]);
+    const job = await this.db.claimNextQueueJob(workerName, WORKER_KINDS[workerName]);
     if (!job) {
-      this.persistWorker(workerName, { status: "idle" });
+      await this.persistWorker(workerName, { status: "idle" });
       return;
     }
 
     const started = Date.now();
-    this.persistWorker(workerName, { status: "running", activeJobId: job.id });
+    await this.persistWorker(workerName, { status: "running", activeJobId: job.id });
 
     try {
       await this.executeJob(job);
       const elapsed = Date.now() - started;
       const state = this.updateWorkerState(workerName, elapsed, false);
-      this.db.updateQueueJob(job.id, {
+      await this.db.updateQueueJob(job.id, {
         status: "completed",
         lockedAt: undefined,
         lastError: undefined,
         processingTimeMs: elapsed,
         completedAt: new Date().toISOString(),
       });
-      this.db.addQueueJobLog(job.workspaceId, job.id, workerName, "completed", `Completed ${job.kind} job in ${elapsed}ms.`);
-      this.persistWorker(workerName, {
+      await this.db.addQueueJobLog(job.workspaceId, job.id, workerName, "completed", `Completed ${job.kind} job in ${elapsed}ms.`);
+      await this.persistWorker(workerName, {
         status: "idle",
         activeJobId: undefined,
         processedJobs: state.processedJobs,
@@ -247,31 +255,31 @@ export class QueueEngine {
     } catch (error: any) {
       const elapsed = Date.now() - started;
       const state = this.updateWorkerState(workerName, elapsed, true);
-      const latest = this.db.getQueueJobById(job.id) || job;
+      const latest = await this.db.getQueueJobById(job.id) || job;
       const attemptsUsed = latest.attemptCount;
       const message = error?.message || "Queue worker execution failed.";
 
       if (attemptsUsed < latest.maxAttempts) {
         const nextBackoff = latest.backoffMs * Math.pow(2, Math.max(0, attemptsUsed - 1));
-        this.db.updateQueueJob(job.id, {
+        await this.db.updateQueueJob(job.id, {
           status: "retrying",
           lockedAt: undefined,
           lastError: message,
           processingTimeMs: elapsed,
           nextRunAt: new Date(Date.now() + nextBackoff).toISOString(),
         });
-        this.db.addQueueJobLog(job.workspaceId, job.id, workerName, "retrying", `Retrying in ${nextBackoff}ms: ${message}`);
+        await this.db.addQueueJobLog(job.workspaceId, job.id, workerName, "retrying", `Retrying in ${nextBackoff}ms: ${message}`);
       } else {
-        this.db.moveQueueJobToDeadLetter(job.id, message);
+        await this.db.moveQueueJobToDeadLetter(job.id, message);
         if (job.kind === "product_import" && job.payload && typeof job.payload === "object" && "operationId" in job.payload) {
           const opId = String(job.payload.operationId);
           const extractorName = (job.payload as any).extractor || "Unknown";
           const fullError = `[${extractorName}] ${message}`;
-          this.db.completeImportFailure(opId, job.workspaceId, fullError);
+          await this.db.completeImportFailure(opId, job.workspaceId, fullError);
         }
       }
 
-      this.persistWorker(workerName, {
+      await this.persistWorker(workerName, {
         status: "idle",
         activeJobId: undefined,
         processedJobs: state.processedJobs,
@@ -333,7 +341,7 @@ export class QueueEngine {
       const elapsed = Date.now() - start;
       
       const dbSaveStart = Date.now();
-      const productWithId = this.db.completeImportSuccess(operationId, job.workspaceId, extractedProduct, elapsed);
+      const productWithId = await this.db.completeImportSuccess(operationId, job.workspaceId, extractedProduct, elapsed);
       const dbSaveMs = Date.now() - dbSaveStart;
 
       let telemetryObj = {
@@ -364,12 +372,12 @@ export class QueueEngine {
       telemetryObj.navigationToCatalog = 0.0;
 
       const telemetryStr = JSON.stringify(telemetryObj);
-      this.db.updateImportOperationTelemetry(operationId, telemetryStr);
+      await this.db.updateImportOperationTelemetry(operationId, telemetryStr);
 
     } catch (error: any) {
       const elapsed = Date.now() - start;
       const errorMsg = `[${provider}] ${error.message || "Unknown extraction error"}`;
-      this.db.completeImportFailure(operationId, job.workspaceId, errorMsg, elapsed);
+      await this.db.completeImportFailure(operationId, job.workspaceId, errorMsg, elapsed);
       throw error;
     }
   }
@@ -378,8 +386,8 @@ export class QueueEngine {
     const { storeId } = job.payload as { storeId: string };
     await processShopifySyncQueue(this.db, job.workspaceId, storeId, {
       scheduleAutomations: false,
-      enqueueAutomationTask: (task) => {
-        this.db.enqueueQueueJob(job.workspaceId, {
+      enqueueAutomationTask: async (task) => {
+        await this.db.enqueueQueueJob(job.workspaceId, {
           kind: "automation_execution",
           workerName: "automation-worker",
           referenceId: `${task.action}:${task.storeId}:${task.productId || "store"}`,
@@ -402,13 +410,14 @@ export class QueueEngine {
       languageCode?: string;
       creditsRequired: number;
     };
-    const product = this.db.getProducts(job.workspaceId).find((item) => item.id === productId);
+    const workspaceProducts = await this.db.getProducts(job.workspaceId);
+    const product = workspaceProducts.find((item) => item.id === productId);
     if (!product) {
       throw new Error("Product not found or access denied.");
     }
-    const analysis = this.db.getLatestProductAnalysis(productId);
+    const analysis = await this.db.getLatestProductAnalysis(productId);
     const payload = await ContentGenerator.generate(product, analysis, contentType, languageCode);
-    this.db.saveContentGeneration(productId, job.workspaceId, contentType, creditsRequired, payload);
+    await this.db.saveContentGeneration(productId, job.workspaceId, contentType, creditsRequired, payload);
   }
 
   private async handleVideoRendering(job: QueueJobRecord): Promise<void> {
@@ -430,10 +439,10 @@ export class QueueEngine {
     };
 
     if (action === "auto_sync") {
-      refreshShopifyAccessToken(this.db, job.workspaceId, storeId);
-      const syncJobs = enqueueStoreSync(this.db, job.workspaceId, storeId);
-      syncJobs.forEach((syncJob) => {
-        this.db.enqueueQueueJob(job.workspaceId, {
+      await refreshShopifyAccessToken(this.db, job.workspaceId, storeId);
+      const syncJobs = await enqueueStoreSync(this.db, job.workspaceId, storeId);
+      for (const syncJob of syncJobs) {
+        await this.db.enqueueQueueJob(job.workspaceId, {
           kind: "shopify_sync",
           workerName: "shopify-worker",
           referenceId: syncJob.id,
@@ -445,8 +454,8 @@ export class QueueEngine {
           maxAttempts: 4,
           backoffMs: 2000,
         });
-      });
-      this.db.saveShopifyAutomationRun(job.workspaceId, storeId, "auto_sync", "completed", detail);
+      }
+      await this.db.saveShopifyAutomationRun(job.workspaceId, storeId, "auto_sync", "completed", detail);
       return;
     }
 
@@ -454,17 +463,18 @@ export class QueueEngine {
       throw new Error("Automation productId is required.");
     }
 
-    const product = this.db.getProducts(job.workspaceId).find((item) => item.id === productId);
+    const workspaceProducts = await this.db.getProducts(job.workspaceId);
+    const product = workspaceProducts.find((item) => item.id === productId);
     if (!product) {
       throw new Error("Automation product not found.");
     }
 
-    const latestContent = this.db.getLatestContentGeneration(productId);
-    const latestAnalysis = this.db.getLatestProductAnalysis(productId);
+    const latestContent = await this.db.getLatestContentGeneration(productId);
+    const latestAnalysis = await this.db.getLatestProductAnalysis(productId);
 
     if (action === "auto_publish_generated_content") {
       const status = latestContent ? "completed" : "failed";
-      this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, status, detail, productId);
+      await this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, status, detail, productId);
       if (!latestContent) {
         throw new Error("No generated content available for auto publish.");
       }
@@ -472,7 +482,7 @@ export class QueueEngine {
     }
 
     if (action === "auto_create_social_posts") {
-      this.db.saveSocialPosts(job.workspaceId, productId, [
+      await this.db.saveSocialPosts(job.workspaceId, productId, [
         {
           platform: "instagram",
           title: `${product.title} Social Launch`,
@@ -485,7 +495,7 @@ export class QueueEngine {
           sourceGenerationId: latestContent?.id,
         },
       ]);
-      this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, "completed", detail, productId);
+      await this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, "completed", detail, productId);
       return;
     }
 
@@ -503,7 +513,7 @@ export class QueueEngine {
         aspectRatio: "9:16",
         sourceImageUrls: [product.images, ...product.gallery].filter(Boolean),
       });
-      this.db.enqueueQueueJob(job.workspaceId, {
+      await this.db.enqueueQueueJob(job.workspaceId, {
         kind: "ai_video_rendering",
         workerName: "video-worker",
         referenceId: draft.id,
@@ -515,12 +525,12 @@ export class QueueEngine {
         maxAttempts: 4,
         backoffMs: 2500,
       });
-      this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, "completed", detail, productId);
+      await this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, "completed", detail, productId);
       return;
     }
 
     if (action === "auto_competitor_monitoring") {
-      this.db.enqueueQueueJob(job.workspaceId, {
+      await this.db.enqueueQueueJob(job.workspaceId, {
         kind: "competitor_monitoring",
         workerName: "automation-worker",
         referenceId: productId,
@@ -534,7 +544,7 @@ export class QueueEngine {
         maxAttempts: 3,
         backoffMs: 5000,
       });
-      this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, "completed", detail, productId);
+      await this.db.saveShopifyAutomationRun(job.workspaceId, storeId, action, "completed", detail, productId);
     }
   }
 
@@ -544,13 +554,14 @@ export class QueueEngine {
       storeId?: string;
       detail?: string;
     };
-    const product = this.db.getProducts(job.workspaceId).find((item) => item.id === productId);
+    const workspaceProducts = await this.db.getProducts(job.workspaceId);
+    const product = workspaceProducts.find((item) => item.id === productId);
     if (!product) {
       throw new Error("Competitor monitoring product not found.");
     }
     await ProductAnalyzer.analyze(product, "en", job.workspaceId);
     if (storeId) {
-      this.db.saveShopifyAutomationRun(
+      await this.db.saveShopifyAutomationRun(
         job.workspaceId,
         storeId,
         "auto_competitor_monitoring",

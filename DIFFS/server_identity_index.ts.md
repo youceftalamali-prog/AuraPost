@@ -1,0 +1,19 @@
+# Diff: server/identity/index.ts
+
+```diff
+--- original_reference/server/identity/index.ts	2026-07-06 18:23:36.000000000 +0000
++++ audit/server/identity/index.ts	2026-07-09 05:49:08.445710249 +0000
+@@ -5,9 +5,9 @@
+ export * from "./repositories/UserRepository";
+ export * from "./repositories/SessionRepository";
+ export * from "./repositories/RefreshTokenRepository";
+-export * from "./repositories/SqliteUserRepository";
+-export * from "./repositories/SqliteSessionRepository";
+-export * from "./repositories/SqliteRefreshTokenRepository";
++export * from "./repositories/PostgresUserRepository";
++export * from "./repositories/PostgresSessionRepository";
++export * from "./repositories/PostgresRefreshTokenRepository";
+ 
+ export * from "./services/PasswordService";
+ export * from "./services/JwtService";
+```

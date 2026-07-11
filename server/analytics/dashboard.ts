@@ -41,6 +41,7 @@ interface ProductMetric {
   opportunityScore: number;
   confidence: number;
   hookCount: number;
+  realContentGenerationsInRange: number;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -137,14 +138,6 @@ function bucketKey(dateValue: string): string {
   return toIsoDate(new Date(dateValue));
 }
 
-function hashString(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) % 100000;
-  }
-  return hash;
-}
-
 function getLatestAnalysisMap(analyses: ProductAnalysis[]): Map<string, ProductAnalysis> {
   const latest = new Map<string, ProductAnalysis>();
   analyses
@@ -174,49 +167,31 @@ function buildProductMetrics(
   const latestAnalysisMap = getLatestAnalysisMap(analyses);
   const contentMap = getLatestContentMap(contentGenerations);
 
+  // INTEGRITY FIX (Phase 2 — "Remove fake analytics"): this previously invented
+  // revenue, traffic, conversions, ROI, and engagement using a hash-seeded formula
+  // built from AI opportunity scores. There is no real order or traffic data source
+  // connected in this build (no Shopify Orders API, ad platform, or GA integration -
+  // that work is tracked under Phase 3 of the Production Hardening Plan). Rather than
+  // fabricate numbers, we now report only what is actually verifiable: the AI
+  // opportunity score from a real analysis (if one exists), and real, already-recorded
+  // content generation activity. Revenue/traffic/conversions/ROI/engagement are
+  // reported as 0 (not estimated, not randomized) until a real data source is connected.
   return products.map((product) => {
     const analysis = latestAnalysisMap.get(product.id || "");
     const generations = contentMap.get(product.id || "") || [];
     const inRangeGenerations = generations.filter((generation) =>
       isWithinRange(generation.createdAt, rangeStart, rangeEnd)
     );
-    const productCredits = ledger
-      .filter((entry) => entry.referenceId === product.id && entry.amount < 0 && isWithinRange(entry.createdAt, rangeStart, rangeEnd))
-      .reduce((total, entry) => total + Math.abs(entry.amount), 0);
-    const demand = analysis?.opportunityScores.demand ?? 55;
-    const competition = analysis?.opportunityScores.competition ?? 45;
-    const trend = analysis?.opportunityScores.trend ?? 52;
-    const profitability = analysis?.opportunityScores.profitability ?? 48;
-    const opportunity = analysis?.opportunityScores.overall ?? 58;
-    const confidence = analysis?.confidenceScore ?? 0.72;
+    const opportunity = analysis?.opportunityScores.overall ?? 0;
+    const confidence = analysis?.confidenceScore ?? 0;
     const hookCount = analysis?.creativeIntelligence.hooks.length ?? 0;
-    const generationWeight = inRangeGenerations.length;
-    const seededOffset = hashString(product.id || product.title) % 19;
 
-    const traffic = Math.round(
-      180
-      + demand * 6.2
-      + trend * 5.1
-      + hookCount * 8
-      + generationWeight * 22
-      - competition * 1.5
-      + seededOffset
-    );
-    const conversionRate = clamp(
-      1.3 + profitability * 0.045 + demand * 0.018 - competition * 0.01 + confidence * 1.8,
-      0.9,
-      12.5
-    );
-    const conversions = Math.max(1, Math.round(traffic * (conversionRate / 100)));
-    const revenue = round(conversions * product.price, 2);
-    const fulfillmentCost = revenue * clamp(0.34 - profitability / 1000, 0.18, 0.34);
-    const marketingCost = productCredits * 1.4 + generationWeight * 7 + 25;
-    const totalCost = fulfillmentCost + marketingCost;
-    const roi = totalCost > 0 ? round(((revenue - totalCost) / totalCost) * 100, 2) : 0;
-    const engagementRate = round(
-      clamp(3 + demand * 0.05 + hookCount * 0.45 + generationWeight * 0.8, 2, 32),
-      2
-    );
+    // Not fabricated: these are honestly 0 because no real orders/traffic source is connected.
+    const revenue = 0;
+    const conversions = 0;
+    const traffic = 0;
+    const engagementRate = 0;
+    const roi = 0;
 
     return {
       productId: product.id || product.title,
@@ -230,6 +205,7 @@ function buildProductMetrics(
       opportunityScore: opportunity,
       confidence,
       hookCount,
+      realContentGenerationsInRange: inRangeGenerations.length,
     };
   });
 }
@@ -260,7 +236,6 @@ function buildTimeseries(
     const activeMetrics = metrics.filter((metric) =>
       activeProducts.some((product) => (product.id || "") === metric.productId)
     );
-    const signalMultiplier = 0.72 + ((offset + 1) / dayCount) * 0.55;
     const importCount = operations.filter((operation) =>
       isWithinRange(operation.createdAt, getStartOfDay(current), getEndOfDay(current))
       && (!filteredProductIds || filteredProductIds.has(operation.productId || ""))
@@ -274,21 +249,13 @@ function buildTimeseries(
       && (!filteredProductIds || filteredProductIds.has(generation.productId))
     ).length;
 
-    const revenue = round(
-      activeMetrics.reduce((total, metric) => total + metric.revenue * signalMultiplier * 0.06, 0)
-        + importCount * 42
-        + generationCount * 17,
-      2
-    );
-    const conversions = Math.round(
-      activeMetrics.reduce((total, metric) => total + metric.conversions * signalMultiplier * 0.08, 0)
-        + importCount
-    );
-    const traffic = Math.round(
-      activeMetrics.reduce((total, metric) => total + metric.traffic * signalMultiplier * 0.07, 0)
-        + generationCount * 18
-        + analysisCount * 10
-    );
+    // INTEGRITY FIX (Phase 2): previously fabricated revenue/traffic here by adding
+    // constants derived from unrelated import/generation counts (e.g. "+ generationCount * 17"
+    // as if it were dollars). Revenue/traffic require a real connected order/traffic source
+    // (Phase 3). Reporting 0 here rather than inventing numbers from unrelated activity.
+    const revenue = 0;
+    const conversions = 0;
+    const traffic = 0;
     const engagement = round(
       activeMetrics.length > 0
         ? activeMetrics.reduce((total, metric) => total + metric.engagementRate, 0) / activeMetrics.length
@@ -414,7 +381,11 @@ function buildSocialAnalytics(
     const analysis = latestAnalysisMap.get(metric.productId);
     const topHook = analysis?.creativeIntelligence.hooks[0] || "Refresh hooks to populate social performance data.";
     const generationCount = contentGenerations.filter((generation) => generation.productId === metric.productId).length;
-    const metricValue = Math.round(metric.traffic * (metric.engagementRate / 100) + generationCount * 15);
+    // INTEGRITY FIX (Phase 2): previously fabricated a "metric" value from traffic (which
+    // itself was fabricated) plus an invented "+ generationCount * 15" bonus. Real social
+    // engagement metrics require a connected Meta/TikTok Insights API (not yet implemented).
+    // We report the real, verifiable count of content generations instead of a fake score.
+    const metricValue = generationCount;
 
     return {
       title: metric.title,
@@ -494,7 +465,7 @@ function buildKpis(
       label: "Revenue",
       value: current.revenue,
       change: delta(current.revenue, previous.revenue),
-      helper: "Revenue trend across the selected date range",
+      helper: "Requires a connected order data source (e.g. Shopify Orders API) - not yet connected",
       format: "currency",
     },
     {
@@ -502,7 +473,7 @@ function buildKpis(
       label: "Sales",
       value: current.sales,
       change: delta(current.sales, previous.sales),
-      helper: "Estimated completed orders",
+      helper: "Requires a connected order data source (e.g. Shopify Orders API) - not yet connected",
       format: "number",
     },
     {
@@ -510,7 +481,7 @@ function buildKpis(
       label: "Conversion Rate",
       value: current.conversionRate,
       change: delta(current.conversionRate, previous.conversionRate),
-      helper: "Visitors converting into customers",
+      helper: "Requires connected traffic + order data - not yet connected",
       format: "percent",
     },
     {
@@ -518,7 +489,7 @@ function buildKpis(
       label: "Traffic",
       value: current.traffic,
       change: delta(current.traffic, previous.traffic),
-      helper: "Sessions and acquisition activity",
+      helper: "Requires a connected traffic data source (e.g. Google Analytics) - not yet connected",
       format: "number",
     },
     {
@@ -526,7 +497,7 @@ function buildKpis(
       label: "Engagement",
       value: current.engagementRate,
       change: delta(current.engagementRate, previous.engagementRate),
-      helper: "Customer engagement and social resonance",
+      helper: "Requires a connected social Insights API - not yet connected",
       format: "percent",
     },
     {
@@ -534,7 +505,7 @@ function buildKpis(
       label: "ROI",
       value: current.roi,
       change: delta(current.roi, previous.roi),
-      helper: "Efficiency of spend versus returns",
+      helper: "Requires connected order + spend data - not yet connected",
       format: "percent",
     },
     {
@@ -685,6 +656,16 @@ export function buildAdvancedAnalyticsPayload(input: AnalyticsInput): AdvancedAn
   return {
     dateRange,
     selectedProductId,
+    // INTEGRITY FIX (Phase 2): explicit, honest disclosure instead of silently fabricated numbers.
+    analyticsDataDisclosure: {
+      ordersDataConnected: false,
+      trafficDataConnected: false,
+      message:
+        "Revenue, sales, traffic, conversion, ROI, and engagement metrics require a connected " +
+        "order/traffic data source (e.g. Shopify Orders API, Google Analytics, or a social Insights API). " +
+        "None are connected yet, so these values are reported as 0 rather than estimated. " +
+        "AI Opportunity scores shown here come from real product analyses.",
+    },
     kpis: buildKpis(currentSummary, previousSummary),
     revenueTrend,
     topProducts,
@@ -694,27 +675,27 @@ export function buildAdvancedAnalyticsPayload(input: AnalyticsInput): AdvancedAn
     opportunityAnalytics,
     salesAnalytics: {
       totalSales: currentSummary.sales,
-      averageOrderValue: currentSummary.sales > 0 ? round(currentSummary.revenue / currentSummary.sales, 2) : 0,
-      repeatCustomers: Math.round(currentSummary.sales * 0.24),
-      sellThroughRate: round(clamp(currentSummary.sales / Math.max(1, scopedProducts.length * 40), 0, 1) * 100, 2),
+      averageOrderValue: 0,
+      repeatCustomers: 0,
+      sellThroughRate: 0,
     },
     revenueAnalytics: {
       grossRevenue: currentSummary.revenue,
-      netRevenue: round(currentSummary.revenue * 0.63, 2),
+      netRevenue: 0,
       roi: currentSummary.roi,
       growthRate: currentSummary.growthRate,
     },
     conversionAnalytics: {
       conversionRate: currentSummary.conversionRate,
-      cartToCheckoutRate: round(clamp(currentSummary.conversionRate * 3.1, 15, 82), 2),
-      checkoutToPurchaseRate: round(clamp(currentSummary.conversionRate * 2.25, 25, 91), 2),
-      leadsCaptured: Math.round(currentSummary.traffic * 0.18),
+      cartToCheckoutRate: 0,
+      checkoutToPurchaseRate: 0,
+      leadsCaptured: 0,
     },
     trafficAnalytics: {
       sessions: currentSummary.traffic,
-      uniqueVisitors: Math.round(currentSummary.traffic * 0.78),
-      returningVisitors: Math.round(currentSummary.traffic * 0.22),
-      bounceRate: round(clamp(61 - currentSummary.engagementRate * 0.75, 18, 68), 2),
+      uniqueVisitors: 0,
+      returningVisitors: 0,
+      bounceRate: 0,
     },
     productPerformanceAnalytics: {
       topPerformers: topProducts,

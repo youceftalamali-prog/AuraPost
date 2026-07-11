@@ -1,0 +1,138 @@
+# Diff: server/ai/content-generator.ts
+
+```diff
+--- original_reference/server/ai/content-generator.ts	2026-07-06 18:23:36.000000000 +0000
++++ audit/server/ai/content-generator.ts	2026-07-07 05:43:44.370084787 +0000
+@@ -1,113 +1,6 @@
+ import { NormalizedProduct, ProductAnalysis, SocialIntelligenceResult, SocialPlatform } from "../../src/types.ts";
+ import { AIProviderService } from "./provider.ts";
+ 
+-function getMarketingSeed(product: NormalizedProduct, analysis: ProductAnalysis | null): string[] {
+-  return analysis?.marketingIntelligence?.benefits?.slice(0, 3)
+-    || Object.entries(product.specifications || {}).slice(0, 3).map(([key, value]) => `${key}: ${String(value)}`);
+-}
+-
+-function buildFallbackContentPackage(
+-  product: NormalizedProduct,
+-  analysis: ProductAnalysis | null,
+-  contentType: "hooks" | "scripts" | "package"
+-) {
+-  const benefits = getMarketingSeed(product, analysis);
+-  const primaryBenefit = benefits[0] || `${product.title} delivers a more premium product experience.`;
+-  const positioning = analysis?.brandIntelligence?.brandPositioning?.valueProposition
+-    || `${product.title} is positioned as a cleaner, more premium option in its category.`;
+-  const hookSet = [
+-    { type: "viral", content: `The ${product.title} upgrade shoppers instantly notice.` },
+-    { type: "problem", content: `Still settling for generic versions of ${product.title}?` },
+-    { type: "curiosity", content: `What makes this ${product.title} feel premium at first glance?` },
+-    { type: "emotional", content: `Buy the version that feels as good as it looks.` },
+-    { type: "direct_response", content: `Discover ${product.title} with premium positioning and clearer value.` },
+-    { type: "ugc", content: `I was not planning to talk about this, but this ${product.title} surprised me.` },
+-  ];
+-
+-  const scripts = [
+-    "tiktok",
+-    "ugc",
+-    "reels",
+-    "facebook",
+-    "shorts",
+-  ].map((type) => ({
+-    type,
+-    title: `${product.title} ${type} script`,
+-    hook: hookSet[0].content,
+-    problem: `Most listings fail to show why ${product.title} is worth choosing.`,
+-    solution: `Show ${product.title} with premium visuals, clean proof, and ${primaryBenefit}.`,
+-    benefits: `${primaryBenefit} ${positioning}`,
+-    cta: `Tap to shop ${product.title} now.`,
+-  }));
+-
+-  const packagePayload = {
+-    hooks: [
+-      ...hookSet,
+-      ...hookSet.map((item, index) => ({
+-        ...item,
+-        content: `${item.content} Variation ${index + 1} for ${product.title}.`,
+-      })),
+-      ...hookSet.map((item, index) => ({
+-        ...item,
+-        content: `${item.content} Fast-scroll version ${index + 1}.`,
+-      })),
+-      ...hookSet.map((item, index) => ({
+-        ...item,
+-        content: `${item.content} Premium angle ${index + 1}.`,
+-      })),
+-    ].slice(0, 20),
+-    scripts,
+-    adCopy: [
+-      { platform: "facebook", format: "short", text: `${product.title} gives buyers a premium reason to choose now.` },
+-      { platform: "instagram", format: "medium", text: `Meet ${product.title}. ${primaryBenefit} with cleaner visuals, sharper positioning, and stronger purchase confidence.` },
+-      { platform: "tiktok", format: "short", text: `This ${product.title} looks premium because it is positioned that way from the first second.` },
+-      { platform: "google", format: "long", text: `Shop ${product.title}. ${positioning} Built for better conversion with premium product storytelling.` },
+-    ],
+-    descriptions: {
+-      short: `${product.title} is built for shoppers who want a more premium, clearer buying experience.`,
+-      long: `${product.title}\n\nBenefits:\n- ${primaryBenefit}\n- ${benefits[1] || "Premium visual trust-building"}\n- ${benefits[2] || "Cleaner product differentiation"}`,
+-      seo: `Meta Title: ${product.title} | Meta Description: Shop ${product.title} with premium positioning and clearer value. | Keywords: ${product.title}, premium ${product.vendor}, ecommerce product | Content: ${positioning}`,
+-    },
+-    emails: [
+-      { type: "welcome", subject: `Welcome to ${product.vendor || product.title}`, body: `Thanks for discovering ${product.title}. Expect premium product storytelling, cleaner visuals, and sharper value from here on out.` },
+-      { type: "promotional", subject: `${product.title} is ready to convert`, body: `Lead with ${primaryBenefit} and remind buyers why ${product.title} stands out right now.` },
+-      { type: "abandoned_cart", subject: `Still thinking about ${product.title}?`, body: `Here is the quick reminder: ${positioning} Come back and complete your purchase when you are ready.` },
+-      { type: "launch_campaign", subject: `${product.title} just dropped`, body: `The premium version is live. Discover ${product.title} and see why the buying experience feels sharper from the first click.` },
+-    ],
+-    landingPage: {
+-      headline: `${product.title} with premium clarity`,
+-      subheadline: positioning,
+-      benefits: [
+-        primaryBenefit,
+-        benefits[1] || "Stronger visual trust from the first impression",
+-        benefits[2] || "A clearer premium buying story",
+-      ],
+-      features: [
+-        { name: "Premium positioning", description: "Built to feel elevated in a crowded category." },
+-        { name: "Visual trust", description: "Communicates value quickly with clean product storytelling." },
+-      ],
+-      objections: [
+-        { objection: "Why this over alternatives?", answer: `Because ${product.title} is framed around clearer premium value and stronger proof.` },
+-      ],
+-      faq: [
+-        { question: `What makes ${product.title} different?`, answer: "A cleaner, more confident product story backed by visual proof." },
+-        { question: "Who is it for?", answer: "Shoppers who want less friction and stronger confidence when buying." },
+-      ],
+-      cta: `Shop ${product.title} now`,
+-    },
+-  };
+-
+-  if (contentType === "hooks") {
+-    return { hooks: packagePayload.hooks.slice(0, 24) };
+-  }
+-
+-  if (contentType === "scripts") {
+-    return { scripts };
+-  }
+-
+-  return packagePayload;
+-}
+-
+ export class ContentGenerator {
+   public static async generate(
+     product: NormalizedProduct,
+@@ -268,9 +161,14 @@
+         }
+       );
+       return AIProviderService.cleanAndParseJSON(response.rawContent);
+-    } catch (err) {
+-      console.warn("[Content Generator] Falling back to local deterministic content package:", err);
+-      return buildFallbackContentPackage(product, analysis, contentType);
++    } catch (err: any) {
++      // INTEGRITY FIX (Phase 2): previously silently returned a fully templated/fabricated
++      // content package on any provider failure. Content generation must now fail honestly.
++      console.error("[Content Generator] All configured AI providers failed:", err?.message || err);
++      throw new Error(
++        `Content generation failed: no configured AI provider could complete the request. ` +
++        `${err?.message ? `Underlying error: ${err.message}` : ""} Please verify your AI Provider API keys in Settings and try again.`
++      );
+     }
+   }
+ 
+```

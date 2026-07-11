@@ -148,7 +148,7 @@ export class AIProviderService {
     let preferredProvider = config.preferredProvider;
     if (workspaceId && config.taskName) {
       try {
-        const routing = db.getAIRouting(workspaceId);
+        const routing = await db.getAIRouting(workspaceId);
         if (routing && routing[config.taskName]) {
           preferredProvider = routing[config.taskName] as AIProviderName;
         }
@@ -505,20 +505,66 @@ export class AIProviderService {
         }
         case "claude": {
           testFn = async () => {
-            return apiKey.startsWith("sk-ant-") || apiKey.length > 15;
+            // INTEGRITY FIX (Phase 2): previously only checked string shape/length rather than
+            // actually verifying the key against Anthropic's API.
+            const response = await fetch("https://api.anthropic.com/v1/models", {
+              headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+            });
+            return response.ok;
           };
           break;
         }
-        case "flux":
-        case "stability_ai":
+        case "flux": {
+          testFn = async () => {
+            // INTEGRITY FIX (Phase 2): previously `return apiKey.length > 8` - no real
+            // verification. Now makes a real, lightweight authenticated request to BFL.
+            const response = await fetch("https://api.bfl.ai/v1/get_result?id=connection-test", {
+              headers: { "X-Key": apiKey },
+            });
+            // BFL returns 404/400 for an unknown task id with a VALID key, and 401/403 with an invalid key.
+            return response.status !== 401 && response.status !== 403;
+          };
+          break;
+        }
+        case "stability_ai": {
+          testFn = async () => {
+            const response = await fetch("https://api.stability.ai/v1/user/account", {
+              headers: { Authorization: `Bearer ${apiKey}` },
+            });
+            return response.ok;
+          };
+          break;
+        }
+        case "gemini_images": {
+          testFn = async () => {
+            const response = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+            );
+            return response.ok;
+          };
+          break;
+        }
+        case "openai_images": {
+          testFn = async () => {
+            const client = new OpenAI({ apiKey });
+            const res = await client.models.list();
+            return res.data && res.data.length > 0;
+          };
+          break;
+        }
         case "veo":
         case "runway":
         case "pika":
-        case "gemini_images":
-        case "openai_images":
         case "kling": {
           testFn = async () => {
-            return apiKey.length > 8;
+            // INTEGRITY FIX (Phase 2): these video providers have no real generation
+            // integration yet (see Phase 3 of the Production Hardening Plan). We no longer
+            // report a fake "connected" status for a key we cannot actually verify -
+            // connection testing is explicitly unsupported until real integration exists.
+            throw new Error(
+              `Connection testing for '${provider}' is not yet supported: this provider has no real ` +
+              `generation integration implemented (tracked in Phase 3 of the hardening plan).`
+            );
           };
           break;
         }

@@ -1,0 +1,4545 @@
+# Diff: server/db.ts
+
+```diff
+--- original_reference/server/db.ts	2026-07-06 18:23:36.000000000 +0000
++++ audit/server/db.ts	2026-07-11 07:34:05.173757031 +0000
+@@ -1,7 +1,5 @@
+-import fs from "fs";
+-import path from "path";
+-import initSqlJs from "sql.js";
+ import { v4 as uuidv4 } from "uuid";
++import { Pool, PoolClient } from "pg";
+ import {
+   NormalizedProduct,
+   Workspace,
+@@ -68,40 +66,39 @@
+   getPlanPrice,
+ } from "./billing/plans.ts";
+ import { encrypt, decrypt } from "./encryption.ts";
+-
+-const isProduction = process.env.NODE_ENV === "production";
+-const SQLITE_DIR = isProduction ? "/tmp" : path.join(process.cwd(), "storage");
+-const SQLITE_FILE = path.join(SQLITE_DIR, "aurapost.db");
+-
++import { namedToPositional } from "./db/postgres/namedParams.ts";
++import { POSTGRES_SCHEMA_SQL } from "./db/postgres/schemaSql.ts";
++import { logger } from "./core/observability/logger.ts";
++
++/**
++ * PHASE 2 — POSTGRESQL CUTOVER
++ *
++ * DatabaseManager previously wrapped sql.js (an in-memory WASM SQLite build
++ * that required exporting and rewriting the *entire* database file to disk
++ * after every write — see the original audit's Database Audit section for
++ * why that was a production-readiness risk: no real transactions, no
++ * concurrency safety, and in production the file lived on ephemeral /tmp).
++ *
++ * It now wraps a real, connection-pooled PostgreSQL client (`pg`). Every
++ * public method signature is preserved (same name, same parameters, same
++ * conceptual return shape) with one unavoidable change: every method that
++ * touches the database is now `async` and returns a `Promise`, because
++ * network I/O to a real database server cannot be synchronous in Node.js.
++ * Every call site across the codebase has been updated accordingly (see
++ * POSTGRESQL_CUTOVER_REPORT.md for the full list).
++ *
++ * SQL text and named-parameter objects (`$paramName`) are preserved
++ * unchanged from the pre-cutover implementation wherever possible; a small
++ * conversion helper (`namedToPositional`) maps them onto pg's positional
++ * ($1, $2, ...) placeholders at call time. See db/postgres/namedParams.ts.
++ */
+ export class DatabaseManager {
+   private static instance: DatabaseManager | null = null;
+-  private db: any = null;
++  private pool: Pool | null = null;
+   private isInitialized = false;
+ 
+   private constructor() {}
+ 
+-  private isCorruptedDatabaseError(error: unknown): boolean {
+-    const message = error instanceof Error ? error.message : String(error);
+-    return /database disk image is malformed|file is not a database|unsupported file format/i.test(message);
+-  }
+-
+-  private backupCorruptedDatabase(): string | null {
+-    if (!fs.existsSync(SQLITE_FILE)) {
+-      return null;
+-    }
+-
+-    const backupPath = `${SQLITE_FILE}.${Date.now()}.backup`;
+-    fs.renameSync(SQLITE_FILE, backupPath);
+-    return backupPath;
+-  }
+-
+-  private initializeFreshDatabase(SQL: any): void {
+-    this.db = new SQL.Database();
+-    this.createSchema();
+-    this.seedInitialData();
+-    this.saveToDisk();
+-  }
+-
+   public static async getInstance(): Promise<DatabaseManager> {
+     if (!DatabaseManager.instance) {
+       DatabaseManager.instance = new DatabaseManager();
+@@ -113,748 +110,148 @@
+   private async init(): Promise<void> {
+     if (this.isInitialized) return;
+ 
+-    try {
+-      if (!fs.existsSync(SQLITE_DIR)) {
+-        fs.mkdirSync(SQLITE_DIR, { recursive: true });
+-      }
+-    } catch (error) {
+-      console.error(`[SQLite Warn] Could not ensure SQLite directory at ${SQLITE_DIR}:`, error);
++    const connectionString = process.env.DATABASE_URL;
++    if (!connectionString) {
++      throw new Error(
++        "FATAL: DATABASE_URL environment variable is not set. PostgreSQL is now the " +
++        "only supported database backend (see POSTGRESQL_CUTOVER_REPORT.md). Set " +
++        "DATABASE_URL to a valid postgres:// connection string before starting the server."
++      );
+     }
+ 
+-    let wasmPath = path.join(process.cwd(), "node_modules", "sql.js", "dist", "sql-wasm.wasm");
+-    if (!fs.existsSync(wasmPath)) {
+-      const dirnameFallback = typeof __dirname !== "undefined"
+-        ? path.join(__dirname, "..", "node_modules", "sql.js", "dist", "sql-wasm.wasm")
+-        : "";
+-      if (dirnameFallback && fs.existsSync(dirnameFallback)) {
+-        wasmPath = dirnameFallback;
+-      } else {
+-        const localFallback = typeof __dirname !== "undefined"
+-          ? path.join(__dirname, "node_modules", "sql.js", "dist", "sql-wasm.wasm")
+-          : "";
+-        if (localFallback && fs.existsSync(localFallback)) {
+-          wasmPath = localFallback;
+-        } else {
+-          throw new Error(`FATAL: SQLite WASM not found at standard paths. Checked: ${wasmPath}, ${dirnameFallback}, ${localFallback}`);
+-        }
+-      }
+-    }
+-    const wasmBinary = fs.readFileSync(wasmPath) as any;
+-    const SQL = await initSqlJs({ wasmBinary });
++    this.pool = new Pool({
++      connectionString,
++      max: Number(process.env.PG_POOL_MAX || 10),
++      idleTimeoutMillis: Number(process.env.PG_POOL_IDLE_TIMEOUT_MS || 30000),
++      connectionTimeoutMillis: Number(process.env.PG_POOL_CONN_TIMEOUT_MS || 5000),
++      ssl: process.env.PG_SSL === "false" ? false : { rejectUnauthorized: false },
++    });
+ 
+-    const hasExistingDbFile = fs.existsSync(SQLITE_FILE);
++    this.pool.on("error", (err) => {
++      // An idle client erroring out (e.g. a dropped connection) must not crash the process.
++      logger.error({ err }, "Unexpected error on idle PostgreSQL client");
++    });
+ 
++    // Verify connectivity fails fast and loudly rather than lazily on first query.
++    const client = await this.pool.connect();
+     try {
+-      if (hasExistingDbFile) {
+-        const fileBuffer = fs.readFileSync(SQLITE_FILE);
+-        this.db = new SQL.Database(fileBuffer);
+-      } else {
+-        this.db = new SQL.Database();
+-      }
+-
+-      this.createSchema();
+-      this.seedInitialData();
+-      
+-      this.saveToDisk();
+-    } catch (err) {
+-      if (!hasExistingDbFile || !this.isCorruptedDatabaseError(err)) {
+-        if (!hasExistingDbFile) {
+-          console.error("FATAL: Failed to initialize in-memory SQLite database:", err);
+-        } else {
+-          console.error("Failed to read SQLite file from disk:", err);
+-        }
+-        throw err;
+-      }
+-
+-      const backupPath = this.backupCorruptedDatabase();
+-      console.warn(`[SQLite Warn] Corrupted SQLite database detected at ${SQLITE_FILE}. Renamed to ${backupPath}. Recreating a fresh database.`);
+-
+-      try {
+-        this.initializeFreshDatabase(SQL);
+-      } catch (recoveryError) {
+-        console.error("FATAL: Failed to recreate SQLite database after corruption recovery:", recoveryError);
+-        throw recoveryError;
+-      }
++      await client.query("SELECT 1");
++    } finally {
++      client.release();
+     }
+ 
++    await this.createSchema();
++    await this.seedInitialData();
++
+     this.isInitialized = true;
+-    console.log("[SQLite Database] Fully loaded and operational at:", SQLITE_FILE);
++    logger.info({ event: "db_connected" }, "[PostgreSQL Database] Connected and schema verified.");
+   }
+ 
+-  public saveToDisk(): void {
+-    if (!this.db) return;
++  /**
++   * Runs a write/DDL statement. Named parameters ($paramName) are converted to
++   * positional placeholders automatically — see db/postgres/namedParams.ts.
++   * Public so repository classes (server/identity/repositories/*) can issue
++   * their own parameterized queries without needing access to the raw pool.
++   */
++  public async dbRun(sql: string, params: Record<string, unknown> = {}, client?: PoolClient): Promise<{ changes: number }> {
++    const { text, values } = namedToPositional(sql, params);
++    const executor = client || this.pool;
++    if (!executor) throw new Error("Database pool is not initialized.");
++    const result = await executor.query(text, values);
++    return { changes: result.rowCount || 0 };
++  }
++
++  /** Runs a read query and returns all matching rows. Public — see dbRun() note above. */
++  public async dbAll<T = any>(sql: string, params: Record<string, unknown> = {}, client?: PoolClient): Promise<T[]> {
++    const { text, values } = namedToPositional(sql, params);
++    const executor = client || this.pool;
++    if (!executor) throw new Error("Database pool is not initialized.");
++    const result = await executor.query(text, values);
++    return result.rows as T[];
++  }
++
++  /** Runs a read query and returns the first matching row, or null. Public — see dbRun() note above. */
++  public async dbGet<T = any>(sql: string, params: Record<string, unknown> = {}, client?: PoolClient): Promise<T | null> {
++    const rows = await this.dbAll<T>(sql, params, client);
++    return rows.length > 0 ? rows[0] : null;
++  }
++
++  /** Runs `fn` inside a single BEGIN/COMMIT/ROLLBACK transaction on a dedicated client. Public for cross-table transactional writes from repositories or route handlers. */
++  public async withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
++    if (!this.pool) throw new Error("Database pool is not initialized.");
++    const client = await this.pool.connect();
+     try {
+-      const data = this.db.export();
+-      const buffer = Buffer.from(data);
+-      fs.writeFileSync(SQLITE_FILE, buffer);
++      await client.query("BEGIN");
++      const result = await fn(client);
++      await client.query("COMMIT");
++      return result;
+     } catch (err) {
+-      console.warn("Could not save SQLite to physical disk (possibly due to read-only container filesystem):", err);
++      await client.query("ROLLBACK");
++      throw err;
++    } finally {
++      client.release();
+     }
+   }
+ 
+-  private getTableColumns(tableName: string): string[] {
+-    const stmt = this.db.prepare(`PRAGMA table_info(${tableName})`);
+-    const columns: string[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject() as { name?: string };
+-      if (typeof row.name === "string") {
+-        columns.push(row.name);
+-      }
++  /**
++   * PHASE 2 CUTOVER: no-op retained only so the ~56 pre-existing call sites
++   * throughout this file (`await this.saveToDisk();`) continue to compile
++   * unchanged. Postgres commits each write durably as soon as the query
++   * resolves — there is no separate "flush to disk" step the way sql.js
++   * required (it held the entire database in memory and needed the whole
++   * file re-exported and rewritten after every write).
++   */
++  public async saveToDisk(): Promise<void> {
++    return;
++  }
++
++  /**
++   * PHASE 2 CUTOVER: no-op retained for the same reason as saveToDisk(). This
++   * was sql.js's ALTER-TABLE-if-missing migration helper for evolving the
++   * schema over time. server/db/postgres/schema.sql already defines every
++   * column ensureColumn() used to add, so there is nothing left to migrate.
++   */
++  private async ensureColumn(_tableName: string, _columnName: string, _columnDefinition: string): Promise<void> {
++    return;
++  }
++
++  private async createSchema(): Promise<void> {
++    if (!this.pool) throw new Error("Database pool is not initialized.");
++    // POSTGRES_SCHEMA_SQL contains multiple ';'-separated DDL statements and no
++    // parameters, so pg's simple query protocol executes all of them in one call.
++    await this.pool.query(POSTGRES_SCHEMA_SQL);
++  }
++
++  /** Real database connectivity check for health/readiness endpoints (Phase 2 requirement). */
++  public async healthCheck(): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
++    const start = Date.now();
++    try {
++      if (!this.pool) throw new Error("Pool not initialized");
++      await this.pool.query("SELECT 1");
++      return { ok: true, latencyMs: Date.now() - start };
++    } catch (err: any) {
++      return { ok: false, latencyMs: Date.now() - start, error: err?.message || String(err) };
+     }
+-    stmt.free();
+-    return columns;
+   }
+ 
+-  private ensureColumn(tableName: string, columnName: string, columnDefinition: string): void {
+-    const columns = this.getTableColumns(tableName);
+-    if (!columns.includes(columnName)) {
+-      this.db.run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDefinition}`);
++  public async closePool(): Promise<void> {
++    if (this.pool) {
++      await this.pool.end();
++      this.pool = null;
++      this.isInitialized = false;
+     }
+   }
+ 
+-  private createSchema(): void {
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS workspaces (
+-        id TEXT PRIMARY KEY,
+-        name TEXT NOT NULL,
+-        credits INTEGER DEFAULT 1000,
+-        stripe_customer_id TEXT
+-      );
+-    `);
+-    this.ensureColumn("workspaces", "stripe_customer_id", "TEXT");
+-    this.ensureColumn("workspaces", "ai_routing", "TEXT");
+-    this.ensureColumn("workspaces", "ai_usage_stats", "TEXT");
+-    
+-this.db.run(`  CREATE TABLE IF NOT EXISTS users (
+-  id TEXT PRIMARY KEY,
+-
+-  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+-  password_hash TEXT NOT NULL,
+-
+-  first_name TEXT NOT NULL,
+-  last_name TEXT NOT NULL,
+-
+-  avatar TEXT,
+-
+-  auth_provider TEXT NOT NULL DEFAULT 'email',
+-  provider_id TEXT,
+-
+-  role TEXT NOT NULL DEFAULT 'owner',
+-  status TEXT NOT NULL DEFAULT 'active',
+-
+-  email_verified INTEGER NOT NULL DEFAULT 0,
+-
+-  last_login_at TEXT,
+-
+-  created_at TEXT NOT NULL,
+-  updated_at TEXT NOT NULL
+-   );
+-`); 
+-
+-this.db.run("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);");
+-this.db.run("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);");
+-this.db.run("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);");
+-this.db.run("CREATE INDEX IF NOT EXISTS idx_users_auth_provider ON users(auth_provider);");
+-this.db.run("CREATE INDEX IF NOT EXISTS idx_users_provider_id ON users(provider_id);");
+-this.db.run("CREATE INDEX IF NOT EXISTS idx_users_auth_provider_provider_id ON users(auth_provider, provider_id);");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS billing_subscriptions (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL UNIQUE,
+-        plan TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        billing_interval TEXT NOT NULL DEFAULT 'monthly',
+-        stripe_customer_id TEXT,
+-        stripe_subscription_id TEXT,
+-        stripe_portal_url TEXT,
+-        stripe_checkout_session_id TEXT,
+-        stripe_mode TEXT NOT NULL DEFAULT 'sandbox',
+-        trial_ends_at TEXT,
+-        current_period_start TEXT NOT NULL,
+-        current_period_end TEXT NOT NULL,
+-        cancel_at_period_end INTEGER DEFAULT 0 NOT NULL,
+-        canceled_at TEXT,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL
+-    );
+-  `);
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS workspace_credit_pools (
+-        workspace_id TEXT NOT NULL,
+-        bucket TEXT NOT NULL,
+-        balance INTEGER NOT NULL DEFAULT 0,
+-        monthly_allocation INTEGER NOT NULL DEFAULT 0,
+-        used_this_period INTEGER NOT NULL DEFAULT 0,
+-        updated_at TEXT NOT NULL,
+-        PRIMARY KEY (workspace_id, bucket)
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS billing_invoices (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        subscription_id TEXT,
+-        stripe_invoice_id TEXT,
+-        amount_paid REAL NOT NULL DEFAULT 0,
+-        currency TEXT NOT NULL DEFAULT 'USD',
+-        status TEXT NOT NULL,
+-        hosted_invoice_url TEXT,
+-        invoice_pdf_url TEXT,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS payment_history (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        invoice_id TEXT,
+-        stripe_payment_intent_id TEXT,
+-        amount REAL NOT NULL DEFAULT 0,
+-        currency TEXT NOT NULL DEFAULT 'USD',
+-        status TEXT NOT NULL,
+-        payment_method TEXT NOT NULL,
+-        description TEXT NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT,
+-        event_type TEXT NOT NULL,
+-        payload TEXT NOT NULL,
+-        processed_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_stores (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        shop_domain TEXT NOT NULL,
+-        shop_name TEXT NOT NULL,
+-        access_token TEXT,
+-        refresh_token TEXT,
+-        token_expires_at TEXT,
+-        last_token_refresh_at TEXT,
+-        scopes TEXT NOT NULL,
+-        status TEXT NOT NULL DEFAULT 'connected',
+-        connection_mode TEXT NOT NULL DEFAULT 'sandbox',
+-        is_default INTEGER NOT NULL DEFAULT 0,
+-        connected_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        last_synced_at TEXT
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_sync_jobs (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        scope TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        trigger_source TEXT NOT NULL,
+-        webhook_topic TEXT,
+-        entity_id TEXT,
+-        summary TEXT NOT NULL,
+-        synced_products INTEGER NOT NULL DEFAULT 0,
+-        synced_collections INTEGER NOT NULL DEFAULT 0,
+-        synced_inventory INTEGER NOT NULL DEFAULT 0,
+-        imported_orders INTEGER NOT NULL DEFAULT 0,
+-        imported_customers INTEGER NOT NULL DEFAULT 0,
+-        revenue_imported REAL NOT NULL DEFAULT 0,
+-        automation_executions INTEGER NOT NULL DEFAULT 0,
+-        error_message TEXT,
+-        started_at TEXT,
+-        completed_at TEXT,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_webhook_events (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        topic TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        payload TEXT NOT NULL,
+-        sync_job_id TEXT,
+-        error_message TEXT,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_automation_settings (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL UNIQUE,
+-        auto_sync_every_hour INTEGER NOT NULL DEFAULT 1,
+-        auto_publish_generated_content INTEGER NOT NULL DEFAULT 0,
+-        auto_create_social_posts INTEGER NOT NULL DEFAULT 0,
+-        auto_generate_videos INTEGER NOT NULL DEFAULT 0,
+-        auto_competitor_monitoring INTEGER NOT NULL DEFAULT 0,
+-        last_auto_sync_at TEXT,
+-        last_automation_run_at TEXT,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_automation_runs (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        action TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        detail TEXT NOT NULL,
+-        product_id TEXT,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_product_links (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        product_id TEXT NOT NULL,
+-        shopify_product_id TEXT NOT NULL,
+-        handle TEXT,
+-        inventory_quantity INTEGER NOT NULL DEFAULT 0,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_collections (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        shopify_collection_id TEXT NOT NULL,
+-        title TEXT NOT NULL,
+-        handle TEXT,
+-        products_count INTEGER NOT NULL DEFAULT 0,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_orders (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        shopify_order_id TEXT NOT NULL,
+-        order_number TEXT NOT NULL,
+-        customer_email TEXT,
+-        total_price REAL NOT NULL DEFAULT 0,
+-        currency TEXT NOT NULL DEFAULT 'USD',
+-        status TEXT NOT NULL DEFAULT 'open',
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS shopify_customers (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_id TEXT NOT NULL,
+-        shopify_customer_id TEXT NOT NULL,
+-        email TEXT,
+-        first_name TEXT,
+-        last_name TEXT,
+-        orders_count INTEGER NOT NULL DEFAULT 0,
+-        total_spent REAL NOT NULL DEFAULT 0,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS queue_jobs (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        kind TEXT NOT NULL,
+-        worker_name TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        reference_id TEXT,
+-        payload TEXT NOT NULL,
+-        priority INTEGER NOT NULL DEFAULT 5,
+-        attempt_count INTEGER NOT NULL DEFAULT 0,
+-        max_attempts INTEGER NOT NULL DEFAULT 3,
+-        backoff_ms INTEGER NOT NULL DEFAULT 1000,
+-        next_run_at TEXT NOT NULL,
+-        locked_at TEXT,
+-        last_error TEXT,
+-        dead_letter_reason TEXT,
+-        processing_time_ms INTEGER,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        completed_at TEXT
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS queue_job_logs (
+-        id TEXT PRIMARY KEY,
+-        job_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        message TEXT NOT NULL,
+-        worker_name TEXT NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS queue_workers (
+-        worker_name TEXT PRIMARY KEY,
+-        status TEXT NOT NULL,
+-        active_job_id TEXT,
+-        memory_usage_mb REAL NOT NULL DEFAULT 0,
+-        queue_length INTEGER NOT NULL DEFAULT 0,
+-        failed_jobs INTEGER NOT NULL DEFAULT 0,
+-        processed_jobs INTEGER NOT NULL DEFAULT 0,
+-        average_processing_time_ms REAL NOT NULL DEFAULT 0,
+-        last_heartbeat_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS dead_letter_jobs (
+-        id TEXT PRIMARY KEY,
+-        source_job_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        kind TEXT NOT NULL,
+-        worker_name TEXT NOT NULL,
+-        payload TEXT NOT NULL,
+-        attempts INTEGER NOT NULL,
+-        last_error TEXT NOT NULL,
+-        moved_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS products (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        title TEXT NOT NULL,
+-        description TEXT,
+-        images TEXT,
+-        gallery TEXT,
+-        variants TEXT,
+-        specifications TEXT,
+-        vendor TEXT,
+-        price REAL,
+-        compare_at_price REAL,
+-        currency TEXT,
+-        availability INTEGER,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS import_operations (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        provider TEXT NOT NULL,
+-        source_url TEXT NOT NULL,
+-        status TEXT NOT NULL,
+-        credit_charged INTEGER NOT NULL,
+-        error_message TEXT,
+-        product_id TEXT,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-    this.ensureColumn("import_operations", "fetch_time_ms", "INTEGER");
+-    this.ensureColumn("import_operations", "analyze_time_ms", "INTEGER");
+-    this.ensureColumn("import_operations", "telemetry", "TEXT");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS audit_logs (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        action TEXT NOT NULL,
+-        details TEXT NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS product_analyses (
+-        id TEXT PRIMARY KEY,
+-        product_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        version INTEGER DEFAULT 1 NOT NULL,
+-        is_latest INTEGER DEFAULT 1 NOT NULL,
+-        language_code TEXT DEFAULT 'en' NOT NULL,
+-        confidence_score REAL DEFAULT 1.000 NOT NULL,
+-        ai_provider TEXT NOT NULL,
+-        ai_model TEXT NOT NULL,
+-        prompt_tokens_count INTEGER NOT NULL,
+-        completion_tokens_count INTEGER NOT NULL,
+-        latency_milliseconds INTEGER NOT NULL,
+-        opportunity_scores TEXT NOT NULL,
+-        market_intelligence TEXT NOT NULL,
+-        marketing_intelligence TEXT NOT NULL,
+-        brand_intelligence TEXT NOT NULL DEFAULT '{}',
+-        creative_intelligence TEXT NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-    this.ensureColumn("product_analyses", "brand_intelligence", "TEXT NOT NULL DEFAULT '{}'");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS credit_ledger (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        transaction_type TEXT NOT NULL,
+-        amount INTEGER NOT NULL,
+-        running_balance INTEGER NOT NULL,
+-        credit_bucket TEXT,
+-        reference_id TEXT,
+-        description TEXT,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-    this.ensureColumn("credit_ledger", "credit_bucket", "TEXT");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS content_generations (
+-        id TEXT PRIMARY KEY,
+-        product_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        content_type TEXT NOT NULL,
+-        credits_charged INTEGER NOT NULL,
+-        payload TEXT NOT NULL,
+-        version INTEGER NOT NULL,
+-        is_latest INTEGER DEFAULT 1 NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS hooks (
+-        id TEXT PRIMARY KEY,
+-        generation_id TEXT NOT NULL,
+-        product_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        type TEXT NOT NULL,
+-        content TEXT NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS scripts (
+-        id TEXT PRIMARY KEY,
+-        generation_id TEXT NOT NULL,
+-        product_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        type TEXT NOT NULL,
+-        title TEXT NOT NULL,
+-        hook TEXT NOT NULL,
+-        problem TEXT NOT NULL,
+-        solution TEXT NOT NULL,
+-        benefits TEXT NOT NULL,
+-        cta TEXT NOT NULL,
+-        created_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS social_accounts (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        platform TEXT NOT NULL,
+-        platform_user_id TEXT NOT NULL,
+-        username TEXT NOT NULL,
+-        avatar_url TEXT,
+-        access_token TEXT,
+-        refresh_token TEXT,
+-        token_expires_at TEXT,
+-        integration_mode TEXT NOT NULL DEFAULT 'sandbox',
+-        status TEXT NOT NULL DEFAULT 'connected',
+-        connected_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS social_posts (
+-        id TEXT PRIMARY KEY,
+-        batch_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        product_id TEXT NOT NULL,
+-        social_account_id TEXT,
+-        platform TEXT NOT NULL,
+-        title TEXT NOT NULL,
+-        caption TEXT NOT NULL,
+-        hashtags TEXT NOT NULL,
+-        media_urls TEXT NOT NULL,
+-        status TEXT NOT NULL DEFAULT 'draft',
+-        scheduled_at TEXT,
+-        published_at TEXT,
+-        external_post_id TEXT,
+-        preview_text TEXT NOT NULL,
+-        source_type TEXT,
+-        source_generation_id TEXT,
+-        failure_reason TEXT,
+-        metrics TEXT NOT NULL DEFAULT '{}',
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS video_generations (
+-        id TEXT PRIMARY KEY,
+-        product_id TEXT NOT NULL,
+-        workspace_id TEXT NOT NULL,
+-        version INTEGER NOT NULL,
+-        is_latest INTEGER DEFAULT 1 NOT NULL,
+-        template TEXT NOT NULL,
+-        output_type TEXT NOT NULL,
+-        input_mode TEXT NOT NULL,
+-        prompt TEXT NOT NULL,
+-        provider TEXT NOT NULL,
+-        provider_fallback_chain TEXT NOT NULL,
+-        aspect_ratio TEXT NOT NULL,
+-        duration_seconds INTEGER NOT NULL,
+-        status TEXT NOT NULL DEFAULT 'draft',
+-        progress INTEGER NOT NULL DEFAULT 0,
+-        credits_used INTEGER NOT NULL DEFAULT 0,
+-        estimated_render_seconds INTEGER NOT NULL DEFAULT 0,
+-        source_generation_id TEXT,
+-        source_analysis_id TEXT,
+-        source_image_urls TEXT NOT NULL,
+-        title TEXT NOT NULL,
+-        video_url TEXT,
+-        thumbnail_url TEXT,
+-        download_url TEXT,
+-        error_message TEXT,
+-        scenes TEXT NOT NULL,
+-        completed_at TEXT,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL
+-      );
+-    `);
+-
+-    // ─── NEW: Integration Tables ────────────────────────────────────────────
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS workspace_ai_providers (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        provider TEXT NOT NULL,
+-        api_key_encrypted TEXT NOT NULL,
+-        api_key_iv TEXT NOT NULL,
+-        is_enabled INTEGER DEFAULT 1,
+-        priority INTEGER DEFAULT 0,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+-        UNIQUE(workspace_id, provider)
+-      );
+-    `);
+-
+-    this.ensureColumn("workspace_ai_providers", "default_model", "TEXT");
+-    this.ensureColumn("workspace_ai_providers", "monthly_usage", "INTEGER DEFAULT 0");
+-    this.ensureColumn("workspace_ai_providers", "last_connection_date", "TEXT");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS workspace_woocommerce_connections (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        store_url TEXT NOT NULL,
+-        consumer_key_encrypted TEXT NOT NULL,
+-        consumer_key_iv TEXT NOT NULL,
+-        consumer_secret_encrypted TEXT NOT NULL,
+-        consumer_secret_iv TEXT NOT NULL,
+-        is_active INTEGER DEFAULT 1,
+-        last_sync_at TEXT,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+-        UNIQUE(workspace_id)
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS oauth_states (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        platform TEXT NOT NULL,
+-        state TEXT NOT NULL UNIQUE,
+-        redirect_uri TEXT,
+-        created_at TEXT NOT NULL,
+-        expires_at TEXT NOT NULL,
+-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+-      );
+-    `);
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS sessions (
+-        id TEXT PRIMARY KEY,
+-        user_id TEXT NOT NULL,
+-        refresh_token_id TEXT NOT NULL,
+-        ip_address TEXT NOT NULL,
+-        user_agent TEXT NOT NULL,
+-        device TEXT,
+-        platform TEXT,
+-        browser TEXT,
+-        is_active INTEGER NOT NULL DEFAULT 1,
+-        last_activity_at TEXT NOT NULL,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+-      );
+-    `);
+-    this.db.run("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);");
+-    this.db.run("CREATE INDEX IF NOT EXISTS idx_sessions_refresh_token_id ON sessions(refresh_token_id);");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS refresh_tokens (
+-        id TEXT PRIMARY KEY,
+-        user_id TEXT NOT NULL,
+-        token TEXT NOT NULL UNIQUE,
+-        expires_at TEXT NOT NULL,
+-        revoked INTEGER NOT NULL DEFAULT 0,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+-      );
+-    `);
+-    this.db.run("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);");
+-    this.db.run("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);");
+-
+-    this.db.run(`
+-      CREATE TABLE IF NOT EXISTS image_studio_projects (
+-        id TEXT PRIMARY KEY,
+-        workspace_id TEXT NOT NULL,
+-        name TEXT NOT NULL,
+-        aspect_ratio TEXT NOT NULL,
+-        canvas_width INTEGER NOT NULL,
+-        canvas_height INTEGER NOT NULL,
+-        layers TEXT NOT NULL,
+-        created_at TEXT NOT NULL,
+-        updated_at TEXT NOT NULL,
+-        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+-      );
+-    `);
+-    this.db.run("CREATE INDEX IF NOT EXISTS idx_image_studio_projects_workspace_id ON image_studio_projects(workspace_id);");
+-  }
+-
+-  private ensureWorkspaceCreditPools(
++  /**
++   * RESTORED during Phase 2 cutover: this method was accidentally removed along
++   * with the old sql.js createSchema() body it was adjacent to. Restored here,
++   * converted to async/Postgres.
++   */
++  private async ensureWorkspaceCreditPools(
+     workspaceId: string,
+     plan: SubscriptionPlanName,
+     balances?: Partial<Record<CreditBucketName, number>>
+-  ): void {
++  ): Promise<void> {
+     const now = new Date().toISOString();
+     const planDef = getBillingPlan(plan);
+     const allocationMap: Record<CreditBucketName, number> = {
+@@ -863,18 +260,16 @@
+       publishing: planDef.publishingCredits,
+     };
+ 
+-    (["ai", "video", "publishing"] as CreditBucketName[]).forEach((bucket) => {
+-      const stmt = this.db.prepare(
+-        "SELECT balance FROM workspace_credit_pools WHERE workspace_id = $workspaceId AND bucket = $bucket LIMIT 1"
+-      );
+-      stmt.bind({ $workspaceId: workspaceId, $bucket: bucket });
+-      const exists = stmt.step();
+-      stmt.free();
+-      if (exists) {
+-        return;
++    for (const bucket of ["ai", "video", "publishing"] as CreditBucketName[]) {
++      const existingRow = await this.dbGet(
++        "SELECT balance FROM workspace_credit_pools WHERE workspace_id = $workspaceId AND bucket = $bucket LIMIT 1",
++        { $workspaceId: workspaceId, $bucket: bucket }
++      );
++      if (existingRow) {
++        continue;
+       }
+ 
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO workspace_credit_pools (
+           workspace_id, bucket, balance, monthly_allocation, used_this_period, updated_at
+         ) VALUES (
+@@ -888,30 +283,33 @@
+           $updatedAt: now,
+         }
+       );
+-    });
++    }
+ 
+-    this.syncWorkspaceCredits(workspaceId);
++    await this.syncWorkspaceCredits(workspaceId);
+   }
+ 
+-  private ensureSeedWorkspaceBilling(
++  /**
++   * RESTORED during Phase 2 cutover (see ensureWorkspaceCreditPools note above).
++   */
++  private async ensureSeedWorkspaceBilling(
+     workspaceId: string,
+     plan: SubscriptionPlanName,
+     status: SubscriptionStatus,
+     interval: SubscriptionInterval,
+     balances?: Partial<Record<CreditBucketName, number>>
+-  ): void {
++  ): Promise<void> {
+     const now = new Date();
+     const trialEndsAt = status === "trialing"
+       ? new Date(now.getTime() + getBillingPlan(plan).trialDays * 24 * 60 * 60 * 1000).toISOString()
+       : null;
+     const currentPeriodEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+ 
+-    const stmt = this.db.prepare("SELECT id FROM billing_subscriptions WHERE workspace_id = $workspaceId LIMIT 1");
+-    stmt.bind({ $workspaceId: workspaceId });
+-    const exists = stmt.step();
+-    stmt.free();
+-    if (!exists) {
+-      this.db.run(
++    const existingRow = await this.dbGet(
++      "SELECT id FROM billing_subscriptions WHERE workspace_id = $workspaceId LIMIT 1",
++      { $workspaceId: workspaceId }
++    );
++    if (!existingRow) {
++      await this.dbRun(
+         `INSERT INTO billing_subscriptions (
+           id, workspace_id, plan, status, billing_interval, stripe_customer_id, stripe_subscription_id,
+           stripe_portal_url, stripe_checkout_session_id, stripe_mode, trial_ends_at, current_period_start,
+@@ -937,57 +335,60 @@
+       );
+     }
+ 
+-    this.ensureWorkspaceCreditPools(workspaceId, plan, balances);
++    await this.ensureWorkspaceCreditPools(workspaceId, plan, balances);
+   }
+ 
+-  private syncWorkspaceCredits(workspaceId: string): void {
+-    const pools = this.getWorkspaceCreditSummary(workspaceId);
++  private async syncWorkspaceCredits(workspaceId: string): Promise<void> {
++    const pools = await this.getWorkspaceCreditSummary(workspaceId);
+     const totalBalance = pools?.totalBalance || 0;
+-    this.db.run(
++    await this.dbRun(
+       "UPDATE workspaces SET credits = $credits WHERE id = $workspaceId",
+       { $credits: totalBalance, $workspaceId: workspaceId }
+     );
+   }
+ 
+-  private seedInitialData(): void {
+-    const res = this.db.exec("SELECT id FROM workspaces WHERE id = 'default-workspace'");
+-    if (res.length === 0 || res[0].values.length === 0) {
+-      console.log("[SQLite Database] Seeding default workspace and test profiles...");
+-      
+-      this.db.run(`
++  private async seedInitialData(): Promise<void> {
++    const existing = await this.dbGet("SELECT id FROM workspaces WHERE id = 'default-workspace'");
++    if (!existing) {
++      logger.info({ event: "db_seed" }, "[PostgreSQL Database] Seeding default workspace and test profiles...");
++
++      await this.dbRun(`
+         INSERT INTO workspaces (id, name, credits)
+         VALUES ('default-workspace', 'Primary Workspace', 500)
++        ON CONFLICT (id) DO NOTHING
+       `);
+ 
+-      this.db.run(`
++      await this.dbRun(`
+         INSERT INTO workspaces (id, name, credits)
+         VALUES ('competitor-tenant', 'Malicious Competitor LLC', 100),
+                ('exhausted-tenant', 'Out of Credits Corp', 10)
++        ON CONFLICT (id) DO NOTHING
+       `);
+ 
+-      this.db.run(`
++      await this.dbRun(`
+         INSERT INTO credit_ledger (id, workspace_id, transaction_type, amount, running_balance, description, created_at)
+-        VALUES ('seed-1', 'default-workspace', 'subscription_allocation', 500, 500, 'Initial workspace credit allocation', '${new Date().toISOString()}'),
+-               ('seed-2', 'competitor-tenant', 'subscription_allocation', 100, 100, 'Initial workspace credit allocation', '${new Date().toISOString()}'),
+-               ('seed-3', 'exhausted-tenant', 'subscription_allocation', 10, 10, 'Initial workspace credit allocation', '${new Date().toISOString()}')
+-      `);
+-
+-      this.logAudit("default-workspace", "WORKSPACE_SEED", "Provisioned workspace with 500 default credits.");
+-      this.logAudit("competitor-tenant", "WORKSPACE_SEED", "Provisioned isolated playground workspace with 100 credits.");
+-      this.logAudit("exhausted-tenant", "WORKSPACE_SEED", "Provisioned isolated playground workspace with 10 credits.");
++        VALUES ('seed-1', 'default-workspace', 'subscription_allocation', 500, 500, 'Initial workspace credit allocation', $now1),
++               ('seed-2', 'competitor-tenant', 'subscription_allocation', 100, 100, 'Initial workspace credit allocation', $now2),
++               ('seed-3', 'exhausted-tenant', 'subscription_allocation', 10, 10, 'Initial workspace credit allocation', $now3)
++        ON CONFLICT (id) DO NOTHING
++      `, { $now1: new Date().toISOString(), $now2: new Date().toISOString(), $now3: new Date().toISOString() });
++
++      await this.logAudit("default-workspace", "WORKSPACE_SEED", "Provisioned workspace with 500 default credits.");
++      await this.logAudit("competitor-tenant", "WORKSPACE_SEED", "Provisioned isolated playground workspace with 100 credits.");
++      await this.logAudit("exhausted-tenant", "WORKSPACE_SEED", "Provisioned isolated playground workspace with 10 credits.");
+     }
+ 
+-    this.ensureSeedWorkspaceBilling("default-workspace", "pro", "active", "monthly", {
++    await this.ensureSeedWorkspaceBilling("default-workspace", "pro", "active", "monthly", {
+       ai: 260,
+       video: 160,
+       publishing: 80,
+     });
+-    this.ensureSeedWorkspaceBilling("competitor-tenant", "starter", "active", "monthly", {
++    await this.ensureSeedWorkspaceBilling("competitor-tenant", "starter", "active", "monthly", {
+       ai: 60,
+       video: 25,
+       publishing: 15,
+     });
+-    this.ensureSeedWorkspaceBilling("exhausted-tenant", "free", "trialing", "monthly", {
++    await this.ensureSeedWorkspaceBilling("exhausted-tenant", "free", "trialing", "monthly", {
+       ai: 5,
+       video: 3,
+       publishing: 2,
+@@ -996,18 +397,73 @@
+ 
+   // --- Multi-Tenant Isolation Wrappers ---
+ 
+-  public getWorkspace(workspaceId: string): Workspace | null {
+-    const stmt = this.db.prepare("SELECT * FROM workspaces WHERE id = $id");
+-    stmt.bind({ $id: workspaceId });
+-    const hasRow = stmt.step();
+-    if (!hasRow) {
+-      stmt.free();
++  /**
++   * SECURITY FIX (Phase 1): Returns true if the given user is a member of the given workspace.
++   * Used by the requireWorkspaceAccess middleware to prevent cross-tenant (IDOR) access.
++   */
++  public async isWorkspaceMember(userId: string, workspaceId: string): Promise<boolean> {
++    const row = await this.dbGet(
++      "SELECT 1 FROM workspace_members WHERE user_id = $userId AND workspace_id = $workspaceId LIMIT 1",
++      { $userId: userId, $workspaceId: workspaceId }
++    );
++    return !!row;
++  }
++
++  /**
++   * SECURITY FIX (Phase 1): Adds a user as a member of a workspace (idempotent).
++   */
++  public async addWorkspaceMember(userId: string, workspaceId: string, role: string = "owner"): Promise<void> {
++    const id = uuidv4();
++    await this.dbRun(
++      `INSERT INTO workspace_members (id, workspace_id, user_id, role, created_at) VALUES ($id, $workspaceId, $userId, $role, $createdAt) ON CONFLICT (workspace_id, user_id) DO NOTHING`,
++      {
++        $id: id,
++        $workspaceId: workspaceId,
++        $userId: userId,
++        $role: role,
++        $createdAt: new Date().toISOString(),
++      }
++    );
++    await this.saveToDisk();
++  }
++
++  /**
++   * SECURITY FIX (Phase 1): Returns the workspace IDs a given user belongs to.
++   */
++  public async getWorkspaceIdsForUser(userId: string): Promise<string[]> {
++    const rows = await this.dbAll<{ workspace_id?: string }>(
++      "SELECT workspace_id FROM workspace_members WHERE user_id = $userId",
++      { $userId: userId }
++    );
++    const ids: string[] = [];
++    for (const row of rows) {
++      if (row.workspace_id) ids.push(row.workspace_id);
++    }
++    return ids;
++  }
++
++  /**
++   * SECURITY FIX (Phase 1): Ensures a user has at least one workspace membership.
++   * Preserves current single-workspace demo behavior by attaching new users to
++   * "default-workspace" as an owner, while still requiring real membership checks
++   * for every request (closes the previous "any workspaceId is accepted" hole).
++   */
++  public async ensureUserHasWorkspace(userId: string): Promise<string> {
++    const existing = await this.getWorkspaceIdsForUser(userId);
++    if (existing.length > 0) {
++      return existing[0];
++    }
++    await this.addWorkspaceMember(userId, "default-workspace", "owner");
++    return "default-workspace";
++  }
++
++  public async getWorkspace(workspaceId: string): Promise<Workspace | null> {
++    const row = await this.dbGet<any>("SELECT * FROM workspaces WHERE id = $id", { $id: workspaceId });
++    if (!row) {
+       return null;
+     }
+-    const row = stmt.getAsObject();
+-    stmt.free();
+-    const subscription = this.getWorkspaceSubscription(workspaceId);
+-    const creditPools = this.getWorkspaceCreditSummary(workspaceId);
++    const subscription = await this.getWorkspaceSubscription(workspaceId);
++    const creditPools = await this.getWorkspaceCreditSummary(workspaceId);
+     return {
+       id: row.id,
+       name: row.name,
+@@ -1025,19 +481,17 @@
+     };
+   }
+ 
+-  public getAllWorkspaces(): Workspace[] {
+-    const stmt = this.db.prepare("SELECT id FROM workspaces ORDER BY name ASC");
++  public async getAllWorkspaces(): Promise<Workspace[]> {
++    const rows = await this.dbAll<{ id?: string }>("SELECT id FROM workspaces ORDER BY name ASC");
+     const workspaces: Workspace[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject() as { id?: string };
++    for (const row of rows) {
+       if (row.id) {
+-        const workspace = this.getWorkspace(row.id);
++        const workspace = await this.getWorkspace(row.id);
+         if (workspace) {
+           workspaces.push(workspace);
+         }
+       }
+     }
+-    stmt.free();
+     return workspaces;
+   }
+ 
+@@ -1051,17 +505,16 @@
+     };
+   }
+ 
+-  public getWorkspaceCreditSummary(workspaceId: string): WorkspaceCreditSummary | null {
+-    const stmt = this.db.prepare(
+-      "SELECT * FROM workspace_credit_pools WHERE workspace_id = $workspaceId ORDER BY bucket ASC"
++  public async getWorkspaceCreditSummary(workspaceId: string): Promise<WorkspaceCreditSummary | null> {
++    const rows = await this.dbAll<any>(
++      "SELECT * FROM workspace_credit_pools WHERE workspace_id = $workspaceId ORDER BY bucket ASC",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+     const buckets: Partial<Record<CreditBucketName, WorkspaceCreditBucket>> = {};
+-    while (stmt.step()) {
+-      const bucket = this.mapWorkspaceCreditBucket(stmt.getAsObject());
++    for (const row of rows) {
++      const bucket = this.mapWorkspaceCreditBucket(row);
+       buckets[bucket.bucket] = bucket;
+     }
+-    stmt.free();
+     if (!buckets.ai || !buckets.video || !buckets.publishing) {
+       return null;
+     }
+@@ -1087,11 +540,16 @@
+       plan: row.plan as SubscriptionPlanName,
+       status: row.status as SubscriptionStatus,
+       billingInterval: (row.billing_interval || "monthly") as SubscriptionInterval,
++      paymentProvider: row.payment_provider === "stripe" ? "stripe" : "paypal",
+       stripeCustomerId: row.stripe_customer_id || undefined,
+       stripeSubscriptionId: row.stripe_subscription_id || undefined,
+       stripePortalUrl: row.stripe_portal_url || undefined,
+       stripeCheckoutSessionId: row.stripe_checkout_session_id || undefined,
+       stripeMode: row.stripe_mode === "live" ? "live" : "sandbox",
++      paypalSubscriptionId: row.paypal_subscription_id || undefined,
++      paypalPlanId: row.paypal_plan_id || undefined,
++      paypalPayerId: row.paypal_payer_id || undefined,
++      paypalMode: row.paypal_mode === "live" ? "live" : "sandbox",
+       trialEndsAt: row.trial_ends_at || undefined,
+       currentPeriodStart: row.current_period_start,
+       currentPeriodEnd: row.current_period_end,
+@@ -1102,28 +560,25 @@
+     };
+   }
+ 
+-  public getWorkspaceSubscription(workspaceId: string): WorkspaceSubscription | null {
+-    const stmt = this.db.prepare(
+-      "SELECT * FROM billing_subscriptions WHERE workspace_id = $workspaceId LIMIT 1"
++  public async getWorkspaceSubscription(workspaceId: string): Promise<WorkspaceSubscription | null> {
++    const row = await this.dbGet<any>(
++      "SELECT * FROM billing_subscriptions WHERE workspace_id = $workspaceId LIMIT 1",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+-    const subscription = stmt.step() ? this.mapWorkspaceSubscriptionRow(stmt.getAsObject()) : null;
+-    stmt.free();
+-    return subscription;
++    return row ? this.mapWorkspaceSubscriptionRow(row) : null;
+   }
+ 
+-  public getBillingPlans(): BillingPlanDefinition[] {
++  public async getBillingPlans(): Promise<BillingPlanDefinition[]> {
+     return getBillingPlans();
+   }
+ 
+-  public getBillingInvoices(workspaceId: string): BillingInvoice[] {
+-    const stmt = this.db.prepare(
+-      "SELECT * FROM billing_invoices WHERE workspace_id = $workspaceId ORDER BY created_at DESC"
++  public async getBillingInvoices(workspaceId: string): Promise<BillingInvoice[]> {
++    const rows = await this.dbAll<any>(
++      "SELECT * FROM billing_invoices WHERE workspace_id = $workspaceId ORDER BY created_at DESC",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+     const invoices: BillingInvoice[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       invoices.push({
+         id: row.id,
+         workspaceId: row.workspace_id,
+@@ -1137,18 +592,16 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return invoices;
+   }
+ 
+-  public getPaymentHistory(workspaceId: string): PaymentHistoryItem[] {
+-    const stmt = this.db.prepare(
+-      "SELECT * FROM payment_history WHERE workspace_id = $workspaceId ORDER BY created_at DESC"
++  public async getPaymentHistory(workspaceId: string): Promise<PaymentHistoryItem[]> {
++    const rows = await this.dbAll<any>(
++      "SELECT * FROM payment_history WHERE workspace_id = $workspaceId ORDER BY created_at DESC",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+     const payments: PaymentHistoryItem[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       payments.push({
+         id: row.id,
+         workspaceId: row.workspace_id,
+@@ -1162,17 +615,12 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return payments;
+   }
+ 
+-  public getBillingAnalytics(): BillingAnalytics {
+-    const stmt = this.db.prepare("SELECT * FROM billing_subscriptions ORDER BY created_at DESC");
+-    const subscriptions: WorkspaceSubscription[] = [];
+-    while (stmt.step()) {
+-      subscriptions.push(this.mapWorkspaceSubscriptionRow(stmt.getAsObject()));
+-    }
+-    stmt.free();
++  public async getBillingAnalytics(): Promise<BillingAnalytics> {
++    const rows = await this.dbAll<any>("SELECT * FROM billing_subscriptions ORDER BY created_at DESC");
++    const subscriptions: WorkspaceSubscription[] = rows.map((row) => this.mapWorkspaceSubscriptionRow(row));
+ 
+     const activeOrTrialing = subscriptions.filter((item) => item.status === "active" || item.status === "trialing");
+     const activePaid = subscriptions.filter((item) => item.status === "active" && item.plan !== "free");
+@@ -1202,23 +650,23 @@
+     };
+   }
+ 
+-  public getBillingOverview(workspaceId: string): BillingOverview {
+-    const workspace = this.getWorkspace(workspaceId);
+-    const subscription = this.getWorkspaceSubscription(workspaceId);
++  public async getBillingOverview(workspaceId: string): Promise<BillingOverview> {
++    const workspace = await this.getWorkspace(workspaceId);
++    const subscription = await this.getWorkspaceSubscription(workspaceId);
+     if (!workspace || !subscription) {
+       throw new Error("Workspace billing state not found.");
+     }
+     return {
+       workspace,
+       subscription,
+-      plans: this.getBillingPlans(),
+-      invoices: this.getBillingInvoices(workspaceId),
+-      payments: this.getPaymentHistory(workspaceId),
+-      analytics: this.getBillingAnalytics(),
++      plans: await this.getBillingPlans(),
++      invoices: await this.getBillingInvoices(workspaceId),
++      payments: await this.getPaymentHistory(workspaceId),
++      analytics: await this.getBillingAnalytics(),
+     };
+   }
+ 
+-  private resetCreditsToPlanAllocation(workspaceId: string, plan: SubscriptionPlanName): void {
++  private async resetCreditsToPlanAllocation(workspaceId: string, plan: SubscriptionPlanName): Promise<void> {
+     const planDef = getBillingPlan(plan);
+     const balances: Record<CreditBucketName, number> = {
+       ai: planDef.aiCredits,
+@@ -1226,8 +674,8 @@
+       publishing: planDef.publishingCredits,
+     };
+ 
+-    (Object.entries(balances) as Array<[CreditBucketName, number]>).forEach(([bucket, amount]) => {
+-      this.db.run(
++    for (const [bucket, amount] of Object.entries(balances) as Array<[CreditBucketName, number]>) {
++      await this.dbRun(
+         `UPDATE workspace_credit_pools
+          SET balance = $balance,
+              monthly_allocation = $monthlyAllocation,
+@@ -1242,30 +690,35 @@
+           $updatedAt: new Date().toISOString(),
+         }
+       );
+-    });
+-    this.syncWorkspaceCredits(workspaceId);
++    }
++    await this.syncWorkspaceCredits(workspaceId);
+   }
+ 
+-  public updateWorkspaceSubscription(
++  public async updateWorkspaceSubscription(
+     workspaceId: string,
+     patch: Partial<Pick<
+       WorkspaceSubscription,
+       | "plan"
+       | "status"
+       | "billingInterval"
++      | "paymentProvider"
+       | "stripeCustomerId"
+       | "stripeSubscriptionId"
+       | "stripePortalUrl"
+       | "stripeCheckoutSessionId"
+       | "stripeMode"
++      | "paypalSubscriptionId"
++      | "paypalPlanId"
++      | "paypalPayerId"
++      | "paypalMode"
+       | "trialEndsAt"
+       | "currentPeriodStart"
+       | "currentPeriodEnd"
+       | "cancelAtPeriodEnd"
+       | "canceledAt"
+     >>
+-  ): WorkspaceSubscription {
+-    const existing = this.getWorkspaceSubscription(workspaceId);
++  ): Promise<WorkspaceSubscription> {
++    const existing = await this.getWorkspaceSubscription(workspaceId);
+     if (!existing) {
+       throw new Error("Workspace subscription not found.");
+     }
+@@ -1275,11 +728,16 @@
+       plan: patch.plan ?? existing.plan,
+       status: patch.status ?? existing.status,
+       billingInterval: patch.billingInterval ?? existing.billingInterval,
++      paymentProvider: patch.paymentProvider ?? existing.paymentProvider,
+       stripeCustomerId: patch.stripeCustomerId ?? existing.stripeCustomerId,
+       stripeSubscriptionId: patch.stripeSubscriptionId ?? existing.stripeSubscriptionId,
+       stripePortalUrl: patch.stripePortalUrl ?? existing.stripePortalUrl,
+       stripeCheckoutSessionId: patch.stripeCheckoutSessionId ?? existing.stripeCheckoutSessionId,
+       stripeMode: patch.stripeMode ?? existing.stripeMode,
++      paypalSubscriptionId: patch.paypalSubscriptionId ?? existing.paypalSubscriptionId,
++      paypalPlanId: patch.paypalPlanId ?? existing.paypalPlanId,
++      paypalPayerId: patch.paypalPayerId ?? existing.paypalPayerId,
++      paypalMode: patch.paypalMode ?? existing.paypalMode,
+       trialEndsAt: patch.trialEndsAt ?? existing.trialEndsAt,
+       currentPeriodStart: patch.currentPeriodStart ?? existing.currentPeriodStart,
+       currentPeriodEnd: patch.currentPeriodEnd ?? existing.currentPeriodEnd,
+@@ -1288,16 +746,21 @@
+       updatedAt: new Date().toISOString(),
+     };
+ 
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE billing_subscriptions
+        SET plan = $plan,
+            status = $status,
+            billing_interval = $billingInterval,
++           payment_provider = $paymentProvider,
+            stripe_customer_id = $stripeCustomerId,
+            stripe_subscription_id = $stripeSubscriptionId,
+            stripe_portal_url = $stripePortalUrl,
+            stripe_checkout_session_id = $stripeCheckoutSessionId,
+            stripe_mode = $stripeMode,
++           paypal_subscription_id = $paypalSubscriptionId,
++           paypal_plan_id = $paypalPlanId,
++           paypal_payer_id = $paypalPayerId,
++           paypal_mode = $paypalMode,
+            trial_ends_at = $trialEndsAt,
+            current_period_start = $currentPeriodStart,
+            current_period_end = $currentPeriodEnd,
+@@ -1307,6 +770,11 @@
+        WHERE workspace_id = $workspaceId`,
+       {
+         $workspaceId: workspaceId,
++        $paymentProvider: next.paymentProvider,
++        $paypalSubscriptionId: next.paypalSubscriptionId || null,
++        $paypalPlanId: next.paypalPlanId || null,
++        $paypalPayerId: next.paypalPayerId || null,
++        $paypalMode: next.paypalMode,
+         $plan: next.plan,
+         $status: next.status,
+         $billingInterval: next.billingInterval,
+@@ -1325,29 +793,34 @@
+     );
+ 
+     if (next.stripeCustomerId) {
+-      this.db.run(
++      await this.dbRun(
+         "UPDATE workspaces SET stripe_customer_id = $stripeCustomerId WHERE id = $workspaceId",
+         { $workspaceId: workspaceId, $stripeCustomerId: next.stripeCustomerId }
+       );
+     }
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return next;
+   }
+ 
+-  public changeSubscriptionPlan(
++  public async changeSubscriptionPlan(
+     workspaceId: string,
+     input: {
+       plan: SubscriptionPlanName;
+       billingInterval: SubscriptionInterval;
+       status: SubscriptionStatus;
++      paymentProvider?: "paypal" | "stripe";
+       stripeMode?: "sandbox" | "live";
+       stripeCustomerId?: string;
+       stripeSubscriptionId?: string;
+       stripeCheckoutSessionId?: string;
++      paypalMode?: "sandbox" | "live";
++      paypalSubscriptionId?: string;
++      paypalPlanId?: string;
++      paypalPayerId?: string;
+       reason: string;
+     }
+-  ): WorkspaceSubscription {
++  ): Promise<WorkspaceSubscription> {
+     const now = new Date();
+     const currentPeriodEnd = new Date(
+       now.getTime() + (input.billingInterval === "yearly" ? 365 : 30) * 24 * 60 * 60 * 1000
+@@ -1356,14 +829,19 @@
+       ? new Date(now.getTime() + getBillingPlan(input.plan).trialDays * 24 * 60 * 60 * 1000).toISOString()
+       : undefined;
+ 
+-    const subscription = this.updateWorkspaceSubscription(workspaceId, {
++    const subscription = await this.updateWorkspaceSubscription(workspaceId, {
+       plan: input.plan,
+       status: input.status,
+       billingInterval: input.billingInterval,
++      paymentProvider: input.paymentProvider,
+       stripeMode: input.stripeMode,
+       stripeCustomerId: input.stripeCustomerId,
+       stripeSubscriptionId: input.stripeSubscriptionId,
+       stripeCheckoutSessionId: input.stripeCheckoutSessionId,
++      paypalMode: input.paypalMode,
++      paypalSubscriptionId: input.paypalSubscriptionId,
++      paypalPlanId: input.paypalPlanId,
++      paypalPayerId: input.paypalPayerId,
+       trialEndsAt,
+       currentPeriodStart: now.toISOString(),
+       currentPeriodEnd,
+@@ -1371,9 +849,9 @@
+       canceledAt: undefined,
+     });
+ 
+-    this.resetCreditsToPlanAllocation(workspaceId, input.plan);
+-    this.logAudit(workspaceId, "SUBSCRIPTION_PLAN_CHANGED", input.reason);
+-    this.logCreditTransaction(
++    await this.resetCreditsToPlanAllocation(workspaceId, input.plan);
++    await this.logAudit(workspaceId, "SUBSCRIPTION_PLAN_CHANGED", input.reason);
++    await this.logCreditTransaction(
+       workspaceId,
+       "plan_change",
+       0,
+@@ -1381,20 +859,28 @@
+       input.reason
+     );
+ 
+-    return this.getWorkspaceSubscription(workspaceId) as WorkspaceSubscription;
++    return await this.getWorkspaceSubscription(workspaceId) as WorkspaceSubscription;
++  }
++
++  public async getWorkspaceIdByPayPalSubscriptionId(paypalSubscriptionId: string): Promise<string | null> {
++    const row = await this.dbGet<{ workspace_id: string }>(
++      "SELECT workspace_id FROM billing_subscriptions WHERE paypal_subscription_id = $subId LIMIT 1",
++      { $subId: paypalSubscriptionId }
++    );
++    return row?.workspace_id || null;
+   }
+ 
+-  public cancelWorkspaceSubscription(workspaceId: string, immediate = false): WorkspaceSubscription {
+-    const subscription = this.getWorkspaceSubscription(workspaceId);
++  public async cancelWorkspaceSubscription(workspaceId: string, immediate = false): Promise<WorkspaceSubscription> {
++    const subscription = await this.getWorkspaceSubscription(workspaceId);
+     if (!subscription) {
+       throw new Error("Workspace subscription not found.");
+     }
+-    const next = this.updateWorkspaceSubscription(workspaceId, {
++    const next = await this.updateWorkspaceSubscription(workspaceId, {
+       status: immediate ? "canceled" : subscription.status,
+       cancelAtPeriodEnd: !immediate,
+       canceledAt: immediate ? new Date().toISOString() : undefined,
+     });
+-    this.logAudit(
++    await this.logAudit(
+       workspaceId,
+       "SUBSCRIPTION_CANCELED",
+       immediate
+@@ -1404,29 +890,33 @@
+     return next;
+   }
+ 
+-  public createBillingInvoice(
++  public async createBillingInvoice(
+     workspaceId: string,
+     payload: Omit<BillingInvoice, "id" | "workspaceId" | "createdAt">
+-  ): BillingInvoice {
++  ): Promise<BillingInvoice> {
+     const invoice: BillingInvoice = {
+       id: uuidv4(),
+       workspaceId,
+       createdAt: new Date().toISOString(),
++      paymentProvider: payload.paymentProvider || (payload.stripeInvoiceId ? "stripe" : "paypal"),
+       ...payload,
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO billing_invoices (
+-        id, workspace_id, subscription_id, stripe_invoice_id, amount_paid, currency, status,
+-        hosted_invoice_url, invoice_pdf_url, created_at
++        id, workspace_id, subscription_id, payment_provider, stripe_invoice_id, paypal_order_id, paypal_capture_id,
++        amount_paid, currency, status, hosted_invoice_url, invoice_pdf_url, created_at
+       ) VALUES (
+-        $id, $workspaceId, $subscriptionId, $stripeInvoiceId, $amountPaid, $currency, $status,
+-        $hostedInvoiceUrl, $invoicePdfUrl, $createdAt
++        $id, $workspaceId, $subscriptionId, $paymentProvider, $stripeInvoiceId, $paypalOrderId, $paypalCaptureId,
++        $amountPaid, $currency, $status, $hostedInvoiceUrl, $invoicePdfUrl, $createdAt
+       )`,
+       {
+         $id: invoice.id,
+         $workspaceId: workspaceId,
+         $subscriptionId: invoice.subscriptionId || null,
++        $paymentProvider: invoice.paymentProvider,
+         $stripeInvoiceId: invoice.stripeInvoiceId || null,
++        $paypalOrderId: invoice.paypalOrderId || null,
++        $paypalCaptureId: invoice.paypalCaptureId || null,
+         $amountPaid: invoice.amountPaid,
+         $currency: invoice.currency,
+         $status: invoice.status,
+@@ -1435,33 +925,37 @@
+         $createdAt: invoice.createdAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return invoice;
+   }
+ 
+-  public createPaymentHistoryItem(
++  public async createPaymentHistoryItem(
+     workspaceId: string,
+     payload: Omit<PaymentHistoryItem, "id" | "workspaceId" | "createdAt">
+-  ): PaymentHistoryItem {
++  ): Promise<PaymentHistoryItem> {
+     const payment: PaymentHistoryItem = {
+       id: uuidv4(),
+       workspaceId,
+       createdAt: new Date().toISOString(),
++      paymentProvider: payload.paymentProvider || (payload.stripePaymentIntentId ? "stripe" : "paypal"),
+       ...payload,
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO payment_history (
+-        id, workspace_id, invoice_id, stripe_payment_intent_id, amount, currency,
+-        status, payment_method, description, created_at
++        id, workspace_id, invoice_id, payment_provider, stripe_payment_intent_id, paypal_order_id, paypal_capture_id,
++        amount, currency, status, payment_method, description, created_at
+       ) VALUES (
+-        $id, $workspaceId, $invoiceId, $stripePaymentIntentId, $amount, $currency,
+-        $status, $paymentMethod, $description, $createdAt
++        $id, $workspaceId, $invoiceId, $paymentProvider, $stripePaymentIntentId, $paypalOrderId, $paypalCaptureId,
++        $amount, $currency, $status, $paymentMethod, $description, $createdAt
+       )`,
+       {
+         $id: payment.id,
+         $workspaceId: workspaceId,
+         $invoiceId: payment.invoiceId || null,
++        $paymentProvider: payment.paymentProvider,
+         $stripePaymentIntentId: payment.stripePaymentIntentId || null,
++        $paypalOrderId: payment.paypalOrderId || null,
++        $paypalCaptureId: payment.paypalCaptureId || null,
+         $amount: payment.amount,
+         $currency: payment.currency,
+         $status: payment.status,
+@@ -1470,12 +964,54 @@
+         $createdAt: payment.createdAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return payment;
+   }
+ 
+-  public recordStripeWebhookEvent(workspaceId: string | undefined, eventType: string, payload: unknown): void {
+-    this.db.run(
++  /**
++   * PHASE 2 (PayPal integration): idempotency + replay protection for incoming
++   * PayPal webhooks. Returns `true` if this event was already processed (caller
++   * should return 200 without reprocessing, per PayPal's own recommendation),
++   * `false` if this is the first time this event id has been seen (caller should
++   * proceed to process it). The INSERT's UNIQUE constraint on paypal_event_id is
++   * the actual source of truth/safety; the SELECT below is just to give the
++   * caller an early, clear answer without relying on catching a constraint error.
++   */
++  public async recordPayPalWebhookEvent(input: {
++    paypalEventId: string;
++    eventType: string;
++    resourceId?: string;
++    workspaceId?: string;
++    payload: unknown;
++    signatureVerified: boolean;
++  }): Promise<{ alreadyProcessed: boolean }> {
++    const existing = await this.dbGet(
++      "SELECT id FROM paypal_webhook_events WHERE paypal_event_id = $eventId",
++      { $eventId: input.paypalEventId }
++    );
++    if (existing) {
++      return { alreadyProcessed: true };
++    }
++    await this.dbRun(
++      `INSERT INTO paypal_webhook_events (id, paypal_event_id, event_type, resource_id, workspace_id, payload, signature_verified, processed_at)
++       VALUES ($id, $eventId, $eventType, $resourceId, $workspaceId, $payload, $signatureVerified, $processedAt)
++       ON CONFLICT (paypal_event_id) DO NOTHING`,
++      {
++        $id: uuidv4(),
++        $eventId: input.paypalEventId,
++        $eventType: input.eventType,
++        $resourceId: input.resourceId || null,
++        $workspaceId: input.workspaceId || null,
++        $payload: JSON.stringify(input.payload),
++        $signatureVerified: input.signatureVerified ? 1 : 0,
++        $processedAt: new Date().toISOString(),
++      }
++    );
++    return { alreadyProcessed: false };
++  }
++
++  public async recordStripeWebhookEvent(workspaceId: string | undefined, eventType: string, payload: unknown): Promise<void> {
++    await this.dbRun(
+       `INSERT INTO stripe_webhook_events (id, workspace_id, event_type, payload, processed_at)
+        VALUES ($id, $workspaceId, $eventType, $payload, $processedAt)`,
+       {
+@@ -1486,21 +1022,19 @@
+         $processedAt: new Date().toISOString(),
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getProducts(workspaceId: string): NormalizedProduct[] {
+-    const stmt = this.db.prepare(`
++  public async getProducts(workspaceId: string): Promise<NormalizedProduct[]> {
++    const rows = await this.dbAll<any>(`
+       SELECT p.*, io.fetch_time_ms, io.analyze_time_ms 
+       FROM products p
+       LEFT JOIN import_operations io ON p.id = io.product_id
+       WHERE p.workspace_id = $workspaceId 
+       ORDER BY p.created_at DESC
+-    `);
+-    stmt.bind({ $workspaceId: workspaceId });
++    `, { $workspaceId: workspaceId });
+     const products: NormalizedProduct[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       products.push({
+         id: row.id,
+         title: row.title,
+@@ -1519,21 +1053,20 @@
+         analyzeTimeMs: row.analyze_time_ms !== null && row.analyze_time_ms !== undefined ? Number(row.analyze_time_ms) : undefined,
+       });
+     }
+-    stmt.free();
+     return products;
+   }
+ 
+-  public deleteProduct(workspaceId: string, productId: string): boolean {
++  public async deleteProduct(workspaceId: string, productId: string): Promise<boolean> {
+     try {
+-      this.db.run("DELETE FROM products WHERE workspace_id = $workspaceId AND id = $productId", {
++      await this.dbRun("DELETE FROM products WHERE workspace_id = $workspaceId AND id = $productId", {
+         $workspaceId: workspaceId,
+         $productId: productId,
+       });
+-      this.db.run("DELETE FROM import_operations WHERE workspace_id = $workspaceId AND product_id = $productId", {
++      await this.dbRun("DELETE FROM import_operations WHERE workspace_id = $workspaceId AND product_id = $productId", {
+         $workspaceId: workspaceId,
+         $productId: productId,
+       });
+-      this.saveToDisk();
++      await this.saveToDisk();
+       return true;
+     } catch (e) {
+       console.error("[DatabaseManager] Failed to delete product:", e);
+@@ -1541,12 +1074,10 @@
+     }
+   }
+ 
+-  public getImportOperations(workspaceId: string): ImportOperation[] {
+-    const stmt = this.db.prepare("SELECT * FROM import_operations WHERE workspace_id = $workspaceId ORDER BY created_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getImportOperations(workspaceId: string): Promise<ImportOperation[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM import_operations WHERE workspace_id = $workspaceId ORDER BY created_at DESC", { $workspaceId: workspaceId });
+     const ops: ImportOperation[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       ops.push({
+         id: row.id,
+         workspaceId: row.workspace_id,
+@@ -1562,16 +1093,13 @@
+         telemetry: row.telemetry || undefined,
+       });
+     }
+-    stmt.free();
+     return ops;
+   }
+ 
+-  public getAuditLogs(workspaceId: string): AuditLog[] {
+-    const stmt = this.db.prepare("SELECT * FROM audit_logs WHERE workspace_id = $workspaceId ORDER BY created_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getAuditLogs(workspaceId: string): Promise<AuditLog[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM audit_logs WHERE workspace_id = $workspaceId ORDER BY created_at DESC", { $workspaceId: workspaceId });
+     const logs: AuditLog[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       logs.push({
+         id: row.id,
+         workspaceId: row.workspace_id,
+@@ -1580,27 +1108,26 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return logs;
+   }
+ 
+   // --- Strict Transactional Credit Validation and Safe Deduction ---
+ 
+-  public checkCreditBalance(
++  public async checkCreditBalance(
+     workspaceId: string,
+     requiredCredits = 20,
+     bucket: CreditBucketName = "ai"
+-  ): boolean {
++  ): Promise<boolean> {
+     if (process.env.TEST_MODE === "true") {
+       return true;
+     }
+-    const pools = this.getWorkspaceCreditSummary(workspaceId);
++    const pools = await this.getWorkspaceCreditSummary(workspaceId);
+     if (!pools) {
+       return false;
+     }
+     if (pools[bucket].balance < requiredCredits) {
+       const refillAmount = Math.max(200, requiredCredits * 5);
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE workspace_credit_pools
+          SET balance = balance + $refillAmount,
+              updated_at = $updatedAt
+@@ -1612,8 +1139,8 @@
+           $updatedAt: new Date().toISOString(),
+         }
+       );
+-      this.syncWorkspaceCredits(workspaceId);
+-      this.logCreditTransaction(
++      await this.syncWorkspaceCredits(workspaceId);
++      await this.logCreditTransaction(
+         workspaceId,
+         "bonus_credit",
+         refillAmount,
+@@ -1621,7 +1148,7 @@
+         `Automatic Developer Credit Grant (Refill due to low balance)`,
+         bucket
+       );
+-      this.logAudit(
++      await this.logAudit(
+         workspaceId,
+         "CREDITS_REFILL",
+         `Automatically refilled ${refillAmount} credits in pool [${bucket}] to prevent blocking.`
+@@ -1631,21 +1158,21 @@
+     return pools[bucket].balance >= requiredCredits;
+   }
+ 
+-  public consumeCredits(
++  public async consumeCredits(
+     workspaceId: string,
+     bucket: CreditBucketName,
+     amount: number,
+     transactionType: CreditLedgerEntry["transactionType"],
+     referenceId?: string,
+     description?: string
+-  ): boolean {
+-    let pools = this.getWorkspaceCreditSummary(workspaceId);
++  ): Promise<boolean> {
++    let pools = await this.getWorkspaceCreditSummary(workspaceId);
+     if (!pools) {
+       return false;
+     }
+     if (pools[bucket].balance < amount) {
+       const refillAmount = Math.max(200, amount * 5);
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE workspace_credit_pools
+          SET balance = balance + $refillAmount,
+              updated_at = $updatedAt
+@@ -1657,8 +1184,8 @@
+           $updatedAt: new Date().toISOString(),
+         }
+       );
+-      this.syncWorkspaceCredits(workspaceId);
+-      this.logCreditTransaction(
++      await this.syncWorkspaceCredits(workspaceId);
++      await this.logCreditTransaction(
+         workspaceId,
+         "bonus_credit",
+         refillAmount,
+@@ -1666,17 +1193,17 @@
+         `Automatic Developer Credit Grant (Refill due to low balance)`,
+         bucket
+       );
+-      this.logAudit(
++      await this.logAudit(
+         workspaceId,
+         "CREDITS_REFILL",
+         `Automatically refilled ${refillAmount} credits in pool [${bucket}] to prevent operational interruption.`
+       );
+-      pools = this.getWorkspaceCreditSummary(workspaceId);
++      pools = await this.getWorkspaceCreditSummary(workspaceId);
+     }
+ 
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE workspace_credit_pools
+-       SET balance = MAX(0, balance - $amount),
++       SET balance = GREATEST(0, balance - $amount),
+            used_this_period = used_this_period + $amount,
+            updated_at = $updatedAt
+        WHERE workspace_id = $workspaceId AND bucket = $bucket AND balance >= $amount`,
+@@ -1687,23 +1214,23 @@
+         $updatedAt: new Date().toISOString(),
+       }
+     );
+-    this.syncWorkspaceCredits(workspaceId);
+-    this.logCreditTransaction(workspaceId, transactionType, -amount, referenceId, description, bucket);
++    await this.syncWorkspaceCredits(workspaceId);
++    await this.logCreditTransaction(workspaceId, transactionType, -amount, referenceId, description, bucket);
+     return true;
+   }
+ 
+-  public allocateCredits(
++  public async allocateCredits(
+     workspaceId: string,
+     source: Extract<CreditLedgerEntry["transactionType"], "subscription_allocation" | "bonus_credit" | "payment" | "refund" | "plan_change">,
+     balances: Partial<Record<CreditBucketName, number>>,
+     referenceId?: string,
+     description?: string
+-  ): void {
+-    (Object.entries(balances) as Array<[CreditBucketName, number]>).forEach(([bucket, amount]) => {
++  ): Promise<void> {
++    for (const [bucket, amount] of Object.entries(balances) as Array<[CreditBucketName, number]>) {
+       if (!amount) {
+-        return;
++        continue;
+       }
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE workspace_credit_pools
+          SET balance = balance + $amount,
+              updated_at = $updatedAt
+@@ -1715,25 +1242,25 @@
+           $updatedAt: new Date().toISOString(),
+         }
+       );
+-      this.syncWorkspaceCredits(workspaceId);
+-      this.logCreditTransaction(workspaceId, source, amount, referenceId, description, bucket);
+-    });
++      await this.syncWorkspaceCredits(workspaceId);
++      await this.logCreditTransaction(workspaceId, source, amount, referenceId, description, bucket);
++    }
+   }
+ 
+-  public rebalanceWorkspaceCredits(workspaceId: string, totalAmount: number): void {
+-    const subscription = this.getWorkspaceSubscription(workspaceId);
++  public async rebalanceWorkspaceCredits(workspaceId: string, totalAmount: number): Promise<void> {
++    const subscription = await this.getWorkspaceSubscription(workspaceId);
+     const planDef = getBillingPlan(subscription?.plan || "free");
+     const totalAllocation = Math.max(1, planDef.aiCredits + planDef.videoCredits + planDef.publishingCredits);
+     const ai = Math.round((totalAmount * planDef.aiCredits) / totalAllocation);
+     const video = Math.round((totalAmount * planDef.videoCredits) / totalAllocation);
+     const publishing = Math.max(0, totalAmount - ai - video);
+ 
+-    ([
++    for (const [bucket, balance] of ([
+       ["ai", ai],
+       ["video", video],
+       ["publishing", publishing],
+-    ] as Array<[CreditBucketName, number]>).forEach(([bucket, balance]) => {
+-      this.db.run(
++    ] as Array<[CreditBucketName, number]>)) {
++      await this.dbRun(
+         `UPDATE workspace_credit_pools
+          SET balance = $balance,
+              updated_at = $updatedAt
+@@ -1745,15 +1272,15 @@
+           $updatedAt: new Date().toISOString(),
+         }
+       );
+-    });
+-    this.syncWorkspaceCredits(workspaceId);
++    }
++    await this.syncWorkspaceCredits(workspaceId);
+   }
+ 
+-  public createImportOperation(
++  public async createImportOperation(
+     workspaceId: string,
+     provider: string,
+     sourceUrl: string
+-  ): ImportOperation {
++  ): Promise<ImportOperation> {
+     const op: ImportOperation = {
+       id: uuidv4(),
+       workspaceId,
+@@ -1764,7 +1291,7 @@
+       createdAt: new Date().toISOString(),
+     };
+ 
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO import_operations (id, workspace_id, provider, source_url, status, credit_charged, created_at)
+        VALUES ($id, $workspaceId, $provider, $sourceUrl, $status, $creditCharged, $createdAt)`,
+       {
+@@ -1777,21 +1304,21 @@
+         $createdAt: op.createdAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return op;
+   }
+ 
+-  public completeImportSuccess(
++  public async completeImportSuccess(
+     opId: string,
+     workspaceId: string,
+     product: NormalizedProduct,
+     fetchTimeMs?: number,
+     telemetry?: string
+-  ): NormalizedProduct {
++  ): Promise<NormalizedProduct> {
+     const productId = uuidv4();
+     const now = new Date().toISOString();
+ 
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO products (id, workspace_id, title, description, images, gallery, variants, specifications, vendor, price, compare_at_price, currency, availability, created_at)
+        VALUES ($id, $workspaceId, $title, $description, $images, $gallery, $variants, $specifications, $vendor, $price, $compareAtPrice, $currency, $availability, $createdAt)`,
+       {
+@@ -1812,7 +1339,7 @@
+       }
+     );
+ 
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE import_operations
+        SET status = 'success', credit_charged = 20, product_id = $productId, fetch_time_ms = $fetchTime, telemetry = $telemetry
+        WHERE id = $id`,
+@@ -1824,13 +1351,13 @@
+       }
+     );
+ 
+-    this.logAudit(
++    await this.logAudit(
+       workspaceId,
+       "CREDIT_DEBIT",
+       `Charged exactly 20 credits for successful ${product.vendor} product import ("${product.title}").`
+     );
+ 
+-    this.consumeCredits(
++    await this.consumeCredits(
+       workspaceId,
+       "ai",
+       20,
+@@ -1839,19 +1366,19 @@
+       `Charged exactly 20 credits for successful ${product.vendor} product import ("${product.title}").`
+     );
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+ 
+     return { ...product, id: productId };
+   }
+ 
+-  public completeImportFailure(
++  public async completeImportFailure(
+     opId: string,
+     workspaceId: string,
+     errorMessage: string,
+     fetchTimeMs?: number,
+     telemetry?: string
+-  ): void {
+-    this.db.run(
++  ): Promise<void> {
++    await this.dbRun(
+       `UPDATE import_operations
+        SET status = 'failed', credit_charged = 0, error_message = $errorMessage, fetch_time_ms = $fetchTime, telemetry = $telemetry
+        WHERE id = $id`,
+@@ -1863,39 +1390,39 @@
+       }
+     );
+ 
+-    this.logAudit(
++    await this.logAudit(
+       workspaceId,
+       "IMPORT_FAILURE",
+       `Import operation failed: ${errorMessage}. Charged 0 credits (retained existing balance).`
+     );
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public updateImportOperationTelemetry(opId: string, telemetry: string): void {
+-    this.db.run(
++  public async updateImportOperationTelemetry(opId: string, telemetry: string): Promise<void> {
++    await this.dbRun(
+       `UPDATE import_operations
+        SET telemetry = $telemetry
+        WHERE id = $id`,
+       { $id: opId, $telemetry: telemetry }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public updateImportOperationAnalysisTime(workspaceId: string, productId: string, latencyMs: number): void {
+-    this.db.run(
++  public async updateImportOperationAnalysisTime(workspaceId: string, productId: string, latencyMs: number): Promise<void> {
++    await this.dbRun(
+       `UPDATE import_operations
+        SET analyze_time_ms = $latencyMs
+        WHERE workspace_id = $workspaceId AND product_id = $productId`,
+       { $latencyMs: latencyMs, $workspaceId: workspaceId, $productId: productId }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public logAudit(workspaceId: string, action: string, details: string): void {
++  public async logAudit(workspaceId: string, action: string, details: string): Promise<void> {
+     const id = uuidv4();
+     const now = new Date().toISOString();
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO audit_logs (id, workspace_id, action, details, created_at)
+        VALUES ($id, $workspaceId, $action, $details, $createdAt)`,
+       {
+@@ -1908,27 +1435,27 @@
+     );
+   }
+ 
+-  public setCredits(workspaceId: string, amount: number): void {
+-    this.rebalanceWorkspaceCredits(workspaceId, amount);
+-    this.logAudit(workspaceId, "CREDITS_SET", `Workspace balance updated/reset to ${amount} credits.`);
+-    this.saveToDisk();
++  public async setCredits(workspaceId: string, amount: number): Promise<void> {
++    await this.rebalanceWorkspaceCredits(workspaceId, amount);
++    await this.logAudit(workspaceId, "CREDITS_SET", `Workspace balance updated/reset to ${amount} credits.`);
++    await this.saveToDisk();
+   }
+ 
+-  public logCreditTransaction(
++  public async logCreditTransaction(
+     workspaceId: string,
+     transactionType: CreditLedgerEntry["transactionType"],
+     amount: number,
+     referenceId?: string,
+     description?: string,
+     creditBucket?: CreditBucketName
+-  ): void {
++  ): Promise<void> {
+     const id = uuidv4();
+     const now = new Date().toISOString();
+     
+-    const ws = this.getWorkspace(workspaceId);
++    const ws = await this.getWorkspace(workspaceId);
+     const balance = ws ? ws.credits : 0;
+ 
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO credit_ledger (id, workspace_id, transaction_type, amount, running_balance, credit_bucket, reference_id, description, created_at)
+        VALUES ($id, $workspaceId, $transactionType, $amount, $runningBalance, $creditBucket, $referenceId, $description, $createdAt)`,
+       {
+@@ -1943,15 +1470,13 @@
+         $createdAt: now,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getCreditLedger(workspaceId: string): CreditLedgerEntry[] {
+-    const stmt = this.db.prepare("SELECT * FROM credit_ledger WHERE workspace_id = $workspaceId ORDER BY created_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getCreditLedger(workspaceId: string): Promise<CreditLedgerEntry[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM credit_ledger WHERE workspace_id = $workspaceId ORDER BY created_at DESC", { $workspaceId: workspaceId });
+     const ledger: CreditLedgerEntry[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       ledger.push({
+         id: row.id,
+         workspaceId: row.workspace_id,
+@@ -1964,16 +1489,13 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return ledger;
+   }
+ 
+-  public getProductAnalyses(productId: string): ProductAnalysis[] {
+-    const stmt = this.db.prepare("SELECT * FROM product_analyses WHERE product_id = $productId ORDER BY version DESC");
+-    stmt.bind({ $productId: productId });
++  public async getProductAnalyses(productId: string): Promise<ProductAnalysis[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM product_analyses WHERE product_id = $productId ORDER BY version DESC", { $productId: productId });
+     const analyses: ProductAnalysis[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       analyses.push({
+         id: row.id,
+         productId: row.product_id,
+@@ -1997,16 +1519,13 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return analyses;
+   }
+ 
+-  public getLatestProductAnalysis(productId: string): ProductAnalysis | null {
+-    const stmt = this.db.prepare("SELECT * FROM product_analyses WHERE product_id = $productId AND is_latest = 1 LIMIT 1");
+-    stmt.bind({ $productId: productId });
++  public async getLatestProductAnalysis(productId: string): Promise<ProductAnalysis | null> {
+     let analysis: ProductAnalysis | null = null;
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++    const row = await this.dbGet<any>("SELECT * FROM product_analyses WHERE product_id = $productId AND is_latest = 1 LIMIT 1", { $productId: productId });
++    if (row) {
+       analysis = {
+         id: row.id,
+         productId: row.product_id,
+@@ -2030,16 +1549,13 @@
+         createdAt: row.created_at,
+       };
+     }
+-    stmt.free();
+     return analysis;
+   }
+ 
+-  public getWorkspaceProductAnalyses(workspaceId: string): ProductAnalysis[] {
+-    const stmt = this.db.prepare("SELECT * FROM product_analyses WHERE workspace_id = $workspaceId ORDER BY created_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getWorkspaceProductAnalyses(workspaceId: string): Promise<ProductAnalysis[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM product_analyses WHERE workspace_id = $workspaceId ORDER BY created_at DESC", { $workspaceId: workspaceId });
+     const analyses: ProductAnalysis[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       analyses.push({
+         id: row.id,
+         productId: row.product_id,
+@@ -2063,32 +1579,30 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return analyses;
+   }
+ 
+-  public saveProductAnalysis(
++  public async saveProductAnalysis(
+     analysis: Omit<ProductAnalysis, "id" | "version" | "isLatest" | "createdAt">
+-  ): ProductAnalysis {
++  ): Promise<ProductAnalysis> {
+     const id = uuidv4();
+     const now = new Date().toISOString();
+ 
+-    const stmt = this.db.prepare(
+-      "SELECT COALESCE(MAX(version), 0) AS max_v FROM product_analyses WHERE product_id = $productId AND language_code = $language"
++    const versionRow = await this.dbGet<{ max_v: number }>(
++      "SELECT COALESCE(MAX(version), 0) AS max_v FROM product_analyses WHERE product_id = $productId AND language_code = $language",
++      { $productId: analysis.productId, $language: analysis.languageCode }
+     );
+-    stmt.bind({ $productId: analysis.productId, $language: analysis.languageCode });
+     let nextVersion = 1;
+-    if (stmt.step()) {
+-      nextVersion = stmt.getAsObject().max_v + 1;
++    if (versionRow) {
++      nextVersion = versionRow.max_v + 1;
+     }
+-    stmt.free();
+ 
+-    this.db.run(
++    await this.dbRun(
+       "UPDATE product_analyses SET is_latest = 0 WHERE product_id = $productId AND language_code = $language",
+       { $productId: analysis.productId, $language: analysis.languageCode }
+     );
+ 
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO product_analyses (
+         id, product_id, workspace_id, version, is_latest, language_code, confidence_score,
+         ai_provider, ai_model, prompt_tokens_count, completion_tokens_count, latency_milliseconds,
+@@ -2119,7 +1633,7 @@
+       }
+     );
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+ 
+     return {
+       id,
+@@ -2143,17 +1657,17 @@
+     };
+   }
+ 
+-  public chargeCreditsForAnalysis(
++  public async chargeCreditsForAnalysis(
+     workspaceId: string,
+     productId: string,
+     description: string
+-  ): boolean {
+-    if (!this.checkCreditBalance(workspaceId, 20, "ai")) {
++  ): Promise<boolean> {
++    if (!await this.checkCreditBalance(workspaceId, 20, "ai")) {
+       return false;
+     }
+ 
+-    this.logAudit(workspaceId, "CREDIT_DEBIT", `Deducted exactly 20 credits for successful product re-analysis on product ID: ${productId}`);
+-    return this.consumeCredits(
++    await this.logAudit(workspaceId, "CREDIT_DEBIT", `Deducted exactly 20 credits for successful product re-analysis on product ID: ${productId}`);
++    return await this.consumeCredits(
+       workspaceId,
+       "ai",
+       20,
+@@ -2163,12 +1677,10 @@
+     );
+   }
+ 
+-  public getContentGenerations(productId: string): ContentGenerationRecord[] {
+-    const stmt = this.db.prepare("SELECT * FROM content_generations WHERE product_id = $productId ORDER BY version DESC");
+-    stmt.bind({ $productId: productId });
++  public async getContentGenerations(productId: string): Promise<ContentGenerationRecord[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM content_generations WHERE product_id = $productId ORDER BY version DESC", { $productId: productId });
+     const gens: ContentGenerationRecord[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       gens.push({
+         id: row.id,
+         productId: row.product_id,
+@@ -2181,11 +1693,10 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return gens;
+   }
+ 
+-  public getLatestContentGeneration(productId: string, contentType?: string): any | null {
++  public async getLatestContentGeneration(productId: string, contentType?: string): Promise<any | null> {
+     let query = "SELECT * FROM content_generations WHERE product_id = $productId AND is_latest = 1";
+     const bindParams: any = { $productId: productId };
+     if (contentType) {
+@@ -2194,11 +1705,9 @@
+     }
+     query += " LIMIT 1";
+     
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(bindParams);
++    const row = await this.dbGet<any>(query, bindParams);
+     let gen: any = null;
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++    if (row) {
+       gen = {
+         id: row.id,
+         productId: row.product_id,
+@@ -2211,16 +1720,13 @@
+         createdAt: row.created_at,
+       };
+     }
+-    stmt.free();
+     return gen;
+   }
+ 
+-  public getWorkspaceContentGenerations(workspaceId: string): ContentGenerationRecord[] {
+-    const stmt = this.db.prepare("SELECT * FROM content_generations WHERE workspace_id = $workspaceId ORDER BY created_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getWorkspaceContentGenerations(workspaceId: string): Promise<ContentGenerationRecord[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM content_generations WHERE workspace_id = $workspaceId ORDER BY created_at DESC", { $workspaceId: workspaceId });
+     const generations: ContentGenerationRecord[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       generations.push({
+         id: row.id,
+         productId: row.product_id,
+@@ -2233,36 +1739,34 @@
+         createdAt: row.created_at,
+       });
+     }
+-    stmt.free();
+     return generations;
+   }
+ 
+-  public saveContentGeneration(
++  public async saveContentGeneration(
+     productId: string,
+     workspaceId: string,
+     contentType: string,
+     creditsCharged: number,
+     payload: any
+-  ): any {
++  ): Promise<any> {
+     const id = uuidv4();
+     const now = new Date().toISOString();
+ 
+-    const stmt = this.db.prepare(
+-      "SELECT COALESCE(MAX(version), 0) AS max_v FROM content_generations WHERE product_id = $productId AND content_type = $contentType"
++    const versionRow = await this.dbGet<{ max_v: number }>(
++      "SELECT COALESCE(MAX(version), 0) AS max_v FROM content_generations WHERE product_id = $productId AND content_type = $contentType",
++      { $productId: productId, $contentType: contentType }
+     );
+-    stmt.bind({ $productId: productId, $contentType: contentType });
+     let nextVersion = 1;
+-    if (stmt.step()) {
+-      nextVersion = stmt.getAsObject().max_v + 1;
++    if (versionRow) {
++      nextVersion = versionRow.max_v + 1;
+     }
+-    stmt.free();
+ 
+-    this.db.run(
++    await this.dbRun(
+       "UPDATE content_generations SET is_latest = 0 WHERE product_id = $productId AND content_type = $contentType",
+       { $productId: productId, $contentType: contentType }
+     );
+ 
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO content_generations (
+         id, product_id, workspace_id, content_type, credits_charged, payload, version, is_latest, created_at
+       ) VALUES (
+@@ -2281,8 +1785,8 @@
+     );
+ 
+     if (payload.hooks && Array.isArray(payload.hooks)) {
+-      payload.hooks.forEach((hook: any) => {
+-        this.db.run(
++      for (const hook of payload.hooks as any[]) {
++        await this.dbRun(
+           `INSERT INTO hooks (id, generation_id, product_id, workspace_id, type, content, created_at)
+            VALUES ($id, $generationId, $productId, $workspaceId, $type, $content, $createdAt)`,
+           {
+@@ -2295,12 +1799,12 @@
+             $createdAt: now,
+           }
+         );
+-      });
++      }
+     }
+ 
+     if (payload.scripts && Array.isArray(payload.scripts)) {
+-      payload.scripts.forEach((script: any) => {
+-        this.db.run(
++      for (const script of payload.scripts as any[]) {
++        await this.dbRun(
+           `INSERT INTO scripts (id, generation_id, product_id, workspace_id, type, title, hook, problem, solution, benefits, cta, created_at)
+            VALUES ($id, $generationId, $productId, $workspaceId, $type, $title, $hook, $problem, $solution, $benefits, $cta, $createdAt)`,
+           {
+@@ -2318,12 +1822,12 @@
+             $createdAt: now,
+           }
+         );
+-      });
++      }
+     }
+ 
+     if (creditsCharged > 0) {
+-      this.logAudit(workspaceId, "CREDIT_DEBIT", `Deducted exactly ${creditsCharged} credits for content generation ("${contentType}") on product ID: ${productId}`);
+-      this.consumeCredits(
++      await this.logAudit(workspaceId, "CREDIT_DEBIT", `Deducted exactly ${creditsCharged} credits for content generation ("${contentType}") on product ID: ${productId}`);
++      await this.consumeCredits(
+         workspaceId,
+         "ai",
+         creditsCharged,
+@@ -2333,7 +1837,7 @@
+       );
+     }
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+ 
+     return {
+       id,
+@@ -2356,8 +1860,8 @@
+       platformUserId: row.platform_user_id,
+       username: row.username,
+       avatarUrl: row.avatar_url || undefined,
+-      accessToken: row.access_token || undefined,
+-      refreshToken: row.refresh_token || undefined,
++      accessToken: this.decryptTokenField(row.access_token, row.access_token_iv),
++      refreshToken: this.decryptTokenField(row.refresh_token, row.refresh_token_iv),
+       tokenExpiresAt: row.token_expires_at || undefined,
+       integrationMode: row.integration_mode === "live" ? "live" : "sandbox",
+       status: row.status === "needs_reauth" ? "needs_reauth" : "connected",
+@@ -2397,18 +1901,16 @@
+     };
+   }
+ 
+-  public getSocialAccounts(workspaceId: string): SocialAccount[] {
+-    const stmt = this.db.prepare("SELECT * FROM social_accounts WHERE workspace_id = $workspaceId ORDER BY connected_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getSocialAccounts(workspaceId: string): Promise<SocialAccount[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM social_accounts WHERE workspace_id = $workspaceId ORDER BY connected_at DESC", { $workspaceId: workspaceId });
+     const accounts: SocialAccount[] = [];
+-    while (stmt.step()) {
+-      accounts.push(this.mapSocialAccountRow(stmt.getAsObject()));
++    for (const row of rows) {
++      accounts.push(this.mapSocialAccountRow(row));
+     }
+-    stmt.free();
+     return accounts;
+   }
+ 
+-  public createSocialAccount(
++  public async createSocialAccount(
+     workspaceId: string,
+     data: {
+       platform: SocialPlatform;
+@@ -2420,7 +1922,7 @@
+       tokenExpiresAt?: string;
+       integrationMode: "sandbox" | "live";
+     }
+-  ): SocialAccount {
++  ): Promise<SocialAccount> {
+     const account: SocialAccount = {
+       id: uuidv4(),
+       workspaceId,
+@@ -2436,13 +1938,15 @@
+       connectedAt: new Date().toISOString(),
+     };
+ 
+-    this.db.run(
++    const socialEncryptedAccess = this.encryptTokenField(account.accessToken);
++    const socialEncryptedRefresh = this.encryptTokenField(account.refreshToken);
++    await this.dbRun(
+       `INSERT INTO social_accounts (
+-        id, workspace_id, platform, platform_user_id, username, avatar_url, access_token,
+-        refresh_token, token_expires_at, integration_mode, status, connected_at
++        id, workspace_id, platform, platform_user_id, username, avatar_url, access_token, access_token_iv,
++        refresh_token, refresh_token_iv, token_expires_at, integration_mode, status, connected_at
+       ) VALUES (
+-        $id, $workspaceId, $platform, $platformUserId, $username, $avatarUrl, $accessToken,
+-        $refreshToken, $tokenExpiresAt, $integrationMode, $status, $connectedAt
++        $id, $workspaceId, $platform, $platformUserId, $username, $avatarUrl, $accessToken, $accessTokenIv,
++        $refreshToken, $refreshTokenIv, $tokenExpiresAt, $integrationMode, $status, $connectedAt
+       )`,
+       {
+         $id: account.id,
+@@ -2451,8 +1955,10 @@
+         $platformUserId: account.platformUserId,
+         $username: account.username,
+         $avatarUrl: account.avatarUrl || null,
+-        $accessToken: account.accessToken || null,
+-        $refreshToken: account.refreshToken || null,
++        $accessToken: socialEncryptedAccess.value,
++        $accessTokenIv: socialEncryptedAccess.iv,
++        $refreshToken: socialEncryptedRefresh.value,
++        $refreshTokenIv: socialEncryptedRefresh.iv,
+         $tokenExpiresAt: account.tokenExpiresAt || null,
+         $integrationMode: account.integrationMode,
+         $status: account.status,
+@@ -2460,23 +1966,23 @@
+       }
+     );
+ 
+-    this.logAudit(workspaceId, "SOCIAL_ACCOUNT_CONNECTED", `Connected ${account.platform} account @${account.username}.`);
+-    this.saveToDisk();
++    await this.logAudit(workspaceId, "SOCIAL_ACCOUNT_CONNECTED", `Connected ${account.platform} account @${account.username}.`);
++    await this.saveToDisk();
+     return account;
+   }
+ 
+-  public deleteSocialAccount(workspaceId: string, accountId: string): boolean {
++  public async deleteSocialAccount(workspaceId: string, accountId: string): Promise<boolean> {
+     try {
+-      this.db.run(
++      await this.dbRun(
+         "UPDATE social_posts SET social_account_id = NULL WHERE workspace_id = $workspaceId AND social_account_id = $accountId",
+         { $workspaceId: workspaceId, $accountId: accountId }
+       );
+-      this.db.run(
++      await this.dbRun(
+         "DELETE FROM social_accounts WHERE workspace_id = $workspaceId AND id = $accountId",
+         { $workspaceId: workspaceId, $accountId: accountId }
+       );
+-      this.logAudit(workspaceId, "SOCIAL_ACCOUNT_REMOVED", `Removed social account ${accountId}.`);
+-      this.saveToDisk();
++      await this.logAudit(workspaceId, "SOCIAL_ACCOUNT_REMOVED", `Removed social account ${accountId}.`);
++      await this.saveToDisk();
+       return true;
+     } catch (error) {
+       console.error("[DatabaseManager] Failed to delete social account:", error);
+@@ -2484,31 +1990,31 @@
+     }
+   }
+ 
+-  public clearPlatformSocialAccounts(workspaceId: string, platform: string): void {
++  public async clearPlatformSocialAccounts(workspaceId: string, platform: string): Promise<void> {
+     try {
+-      this.db.run(
++      await this.dbRun(
+         "UPDATE social_posts SET social_account_id = NULL WHERE workspace_id = $workspaceId AND platform = $platform",
+         { $workspaceId: workspaceId, $platform: platform }
+       );
+-      this.db.run(
++      await this.dbRun(
+         "DELETE FROM social_accounts WHERE workspace_id = $workspaceId AND platform = $platform",
+         { $workspaceId: workspaceId, $platform: platform }
+       );
+-      this.logAudit(workspaceId, "SOCIAL_ACCOUNT_CLEARED", `Cleared all connected ${platform} accounts.`);
+-      this.saveToDisk();
++      await this.logAudit(workspaceId, "SOCIAL_ACCOUNT_CLEARED", `Cleared all connected ${platform} accounts.`);
++      await this.saveToDisk();
+     } catch (error) {
+       console.error(`[DatabaseManager] Failed to clear platform social accounts for ${platform}:`, error);
+     }
+   }
+ 
+-  public getSocialPosts(
++  public async getSocialPosts(
+     workspaceId: string,
+     options: {
+       productId?: string;
+       status?: SocialPostStatus;
+       includeAll?: boolean;
+     } = {}
+-  ): SocialPost[] {
++  ): Promise<SocialPost[]> {
+     let query = "SELECT * FROM social_posts WHERE workspace_id = $workspaceId";
+     const params: Record<string, string> = { $workspaceId: workspaceId };
+     if (options.productId) {
+@@ -2521,25 +2027,21 @@
+     }
+     query += options.includeAll ? " ORDER BY created_at DESC" : " ORDER BY COALESCE(scheduled_at, created_at) ASC";
+ 
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const posts: SocialPost[] = [];
+-    while (stmt.step()) {
+-      posts.push(this.mapSocialPostRow(stmt.getAsObject()));
++    for (const row of rows) {
++      posts.push(this.mapSocialPostRow(row));
+     }
+-    stmt.free();
+     return posts;
+   }
+ 
+-  public getSocialPostById(workspaceId: string, postId: string): SocialPost | null {
+-    const stmt = this.db.prepare("SELECT * FROM social_posts WHERE workspace_id = $workspaceId AND id = $postId LIMIT 1");
+-    stmt.bind({ $workspaceId: workspaceId, $postId: postId });
+-    const post = stmt.step() ? this.mapSocialPostRow(stmt.getAsObject()) : null;
+-    stmt.free();
++  public async getSocialPostById(workspaceId: string, postId: string): Promise<SocialPost | null> {
++    const row = await this.dbGet<any>("SELECT * FROM social_posts WHERE workspace_id = $workspaceId AND id = $postId LIMIT 1", { $workspaceId: workspaceId, $postId: postId });
++    const post = row ? this.mapSocialPostRow(row) : null;
+     return post;
+   }
+ 
+-  public saveSocialPosts(
++  public async saveSocialPosts(
+     workspaceId: string,
+     productId: string,
+     posts: Array<{
+@@ -2555,10 +2057,10 @@
+       sourceType?: string;
+       sourceGenerationId?: string;
+     }>
+-  ): SocialPost[] {
++  ): Promise<SocialPost[]> {
+     const batchId = uuidv4();
+     const now = new Date().toISOString();
+-    const savedPosts = posts.map((entry) => {
++    const savedPosts = await Promise.all(posts.map(async (entry) => {
+       const post: SocialPost = {
+         id: uuidv4(),
+         batchId,
+@@ -2585,7 +2087,7 @@
+         updatedAt: now,
+       };
+ 
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO social_posts (
+           id, batch_id, workspace_id, product_id, social_account_id, platform, title, caption,
+           hashtags, media_urls, status, scheduled_at, preview_text, source_type, source_generation_id,
+@@ -2618,14 +2120,14 @@
+       );
+ 
+       return post;
+-    });
++    }));
+ 
+-    this.logAudit(workspaceId, "SOCIAL_POSTS_CREATED", `Created ${savedPosts.length} social post records for product ${productId}.`);
+-    this.saveToDisk();
++    await this.logAudit(workspaceId, "SOCIAL_POSTS_CREATED", `Created ${savedPosts.length} social post records for product ${productId}.`);
++    await this.saveToDisk();
+     return savedPosts;
+   }
+ 
+-  public updateSocialPostStatus(
++  public async updateSocialPostStatus(
+     workspaceId: string,
+     postId: string,
+     patch: {
+@@ -2636,8 +2138,8 @@
+       metrics?: SocialPostMetrics;
+       socialAccountId?: string;
+     }
+-  ): SocialPost | null {
+-    const existing = this.getSocialPostById(workspaceId, postId);
++  ): Promise<SocialPost | null> {
++    const existing = await this.getSocialPostById(workspaceId, postId);
+     if (!existing) {
+       return null;
+     }
+@@ -2653,7 +2155,7 @@
+       updatedAt: new Date().toISOString(),
+     };
+ 
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE social_posts
+        SET social_account_id = $socialAccountId,
+            status = $status,
+@@ -2676,7 +2178,7 @@
+       }
+     );
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return updated;
+   }
+ 
+@@ -2714,34 +2216,28 @@
+     };
+   }
+ 
+-  public getVideoGenerations(productId: string): VideoGenerationRecord[] {
+-    const stmt = this.db.prepare("SELECT * FROM video_generations WHERE product_id = $productId ORDER BY version DESC");
+-    stmt.bind({ $productId: productId });
++  public async getVideoGenerations(productId: string): Promise<VideoGenerationRecord[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM video_generations WHERE product_id = $productId ORDER BY version DESC", { $productId: productId });
+     const videos: VideoGenerationRecord[] = [];
+-    while (stmt.step()) {
+-      videos.push(this.mapVideoGenerationRow(stmt.getAsObject()));
++    for (const row of rows) {
++      videos.push(this.mapVideoGenerationRow(row));
+     }
+-    stmt.free();
+     return videos;
+   }
+ 
+-  public getLatestVideoGeneration(productId: string): VideoGenerationRecord | null {
+-    const stmt = this.db.prepare("SELECT * FROM video_generations WHERE product_id = $productId AND is_latest = 1 LIMIT 1");
+-    stmt.bind({ $productId: productId });
+-    const video = stmt.step() ? this.mapVideoGenerationRow(stmt.getAsObject()) : null;
+-    stmt.free();
++  public async getLatestVideoGeneration(productId: string): Promise<VideoGenerationRecord | null> {
++    const row = await this.dbGet<any>("SELECT * FROM video_generations WHERE product_id = $productId AND is_latest = 1 LIMIT 1", { $productId: productId });
++    const video = row ? this.mapVideoGenerationRow(row) : null;
+     return video;
+   }
+ 
+-  public getVideoGenerationById(workspaceId: string, videoId: string): VideoGenerationRecord | null {
+-    const stmt = this.db.prepare("SELECT * FROM video_generations WHERE workspace_id = $workspaceId AND id = $videoId LIMIT 1");
+-    stmt.bind({ $workspaceId: workspaceId, $videoId: videoId });
+-    const video = stmt.step() ? this.mapVideoGenerationRow(stmt.getAsObject()) : null;
+-    stmt.free();
++  public async getVideoGenerationById(workspaceId: string, videoId: string): Promise<VideoGenerationRecord | null> {
++    const row = await this.dbGet<any>("SELECT * FROM video_generations WHERE workspace_id = $workspaceId AND id = $videoId LIMIT 1", { $workspaceId: workspaceId, $videoId: videoId });
++    const video = row ? this.mapVideoGenerationRow(row) : null;
+     return video;
+   }
+ 
+-  public getWorkspaceVideoGenerations(workspaceId: string, productId?: string): VideoGenerationRecord[] {
++  public async getWorkspaceVideoGenerations(workspaceId: string, productId?: string): Promise<VideoGenerationRecord[]> {
+     let query = "SELECT * FROM video_generations WHERE workspace_id = $workspaceId";
+     const params: Record<string, string> = { $workspaceId: workspaceId };
+     if (productId) {
+@@ -2749,38 +2245,35 @@
+       params.$productId = productId;
+     }
+     query += " ORDER BY created_at DESC";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const videos: VideoGenerationRecord[] = [];
+-    while (stmt.step()) {
+-      videos.push(this.mapVideoGenerationRow(stmt.getAsObject()));
++    for (const row of rows) {
++      videos.push(this.mapVideoGenerationRow(row));
+     }
+-    stmt.free();
+     return videos;
+   }
+ 
+-  public saveVideoGeneration(
++  public async saveVideoGeneration(
+     workspaceId: string,
+     productId: string,
+     record: Omit<VideoGenerationRecord, "version" | "isLatest" | "createdAt" | "updatedAt">
+-  ): VideoGenerationRecord {
++  ): Promise<VideoGenerationRecord> {
+     const now = new Date().toISOString();
+-    const stmt = this.db.prepare(
+-      "SELECT COALESCE(MAX(version), 0) AS max_v FROM video_generations WHERE product_id = $productId"
++    const versionRow = await this.dbGet<{ max_v: number }>(
++      "SELECT COALESCE(MAX(version), 0) AS max_v FROM video_generations WHERE product_id = $productId",
++      { $productId: productId }
+     );
+-    stmt.bind({ $productId: productId });
+     let nextVersion = 1;
+-    if (stmt.step()) {
+-      nextVersion = stmt.getAsObject().max_v + 1;
++    if (versionRow) {
++      nextVersion = versionRow.max_v + 1;
+     }
+-    stmt.free();
+ 
+-    this.db.run(
++    await this.dbRun(
+       "UPDATE video_generations SET is_latest = 0 WHERE product_id = $productId",
+       { $productId: productId }
+     );
+ 
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO video_generations (
+         id, product_id, workspace_id, version, is_latest, template, output_type, input_mode, prompt,
+         provider, provider_fallback_chain, aspect_ratio, duration_seconds, status, progress, credits_used,
+@@ -2825,8 +2318,8 @@
+     );
+ 
+     if (record.creditsUsed > 0) {
+-      this.logAudit(workspaceId, "VIDEO_CREDIT_DEBIT", `Deducted ${record.creditsUsed} credits for AI video generation on product ID: ${productId}`);
+-      this.consumeCredits(
++      await this.logAudit(workspaceId, "VIDEO_CREDIT_DEBIT", `Deducted ${record.creditsUsed} credits for AI video generation on product ID: ${productId}`);
++      await this.consumeCredits(
+         workspaceId,
+         "video",
+         record.creditsUsed,
+@@ -2836,7 +2329,7 @@
+       );
+     }
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+ 
+     return {
+       ...record,
+@@ -2847,15 +2340,15 @@
+     };
+   }
+ 
+-  public updateVideoGeneration(
++  public async updateVideoGeneration(
+     workspaceId: string,
+     videoId: string,
+     patch: Partial<Pick<
+       VideoGenerationRecord,
+       "provider" | "status" | "progress" | "videoUrl" | "thumbnailUrl" | "downloadUrl" | "errorMessage" | "completedAt" | "scenes"
+     >>
+-  ): VideoGenerationRecord | null {
+-    const existing = this.getVideoGenerationById(workspaceId, videoId);
++  ): Promise<VideoGenerationRecord | null> {
++    const existing = await this.getVideoGenerationById(workspaceId, videoId);
+     if (!existing) {
+       return null;
+     }
+@@ -2874,7 +2367,7 @@
+       updatedAt: new Date().toISOString(),
+     };
+ 
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE video_generations
+        SET provider = $provider,
+            status = $status,
+@@ -2903,28 +2396,28 @@
+       }
+     );
+ 
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return updated;
+   }
+ 
+-  public deleteVideoGeneration(workspaceId: string, videoId: string): boolean {
++  public async deleteVideoGeneration(workspaceId: string, videoId: string): Promise<boolean> {
+     try {
+-      const existing = this.getVideoGenerationById(workspaceId, videoId);
+-      this.db.run(
++      const existing = await this.getVideoGenerationById(workspaceId, videoId);
++      await this.dbRun(
+         "DELETE FROM video_generations WHERE workspace_id = $workspaceId AND id = $videoId",
+         { $workspaceId: workspaceId, $videoId: videoId }
+       );
+       if (existing?.isLatest) {
+-        const fallback = this.getVideoGenerations(existing.productId)[0];
++        const fallback = await this.getVideoGenerations(existing.productId)[0];
+         if (fallback) {
+-          this.db.run(
++          await this.dbRun(
+             "UPDATE video_generations SET is_latest = 1 WHERE id = $id",
+             { $id: fallback.id }
+           );
+         }
+       }
+-      this.logAudit(workspaceId, "VIDEO_GENERATION_DELETED", `Deleted AI video generation ${videoId}.`);
+-      this.saveToDisk();
++      await this.logAudit(workspaceId, "VIDEO_GENERATION_DELETED", `Deleted AI video generation ${videoId}.`);
++      await this.saveToDisk();
+       return true;
+     } catch (error) {
+       console.error("[DatabaseManager] Failed to delete AI video generation:", error);
+@@ -2938,8 +2431,8 @@
+       workspaceId: row.workspace_id,
+       shopDomain: row.shop_domain,
+       shopName: row.shop_name,
+-      accessToken: row.access_token || undefined,
+-      refreshToken: row.refresh_token || undefined,
++      accessToken: this.decryptTokenField(row.access_token, row.access_token_iv),
++      refreshToken: this.decryptTokenField(row.refresh_token, row.refresh_token_iv),
+       tokenExpiresAt: row.token_expires_at || undefined,
+       lastTokenRefreshAt: row.last_token_refresh_at || undefined,
+       scopes: JSON.parse(row.scopes || "[]"),
+@@ -3021,39 +2514,71 @@
+     };
+   }
+ 
+-  public getShopifyStores(workspaceId: string): ShopifyStoreConnection[] {
+-    const stmt = this.db.prepare("SELECT * FROM shopify_stores WHERE workspace_id = $workspaceId ORDER BY connected_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getShopifyStores(workspaceId: string): Promise<ShopifyStoreConnection[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM shopify_stores WHERE workspace_id = $workspaceId ORDER BY connected_at DESC", { $workspaceId: workspaceId });
+     const stores: ShopifyStoreConnection[] = [];
+-    while (stmt.step()) {
+-      stores.push(this.mapShopifyStoreRow(stmt.getAsObject()));
++    for (const row of rows) {
++      stores.push(this.mapShopifyStoreRow(row));
+     }
+-    stmt.free();
+     return stores;
+   }
+ 
+-  public getShopifyStoreById(workspaceId: string, storeId: string): ShopifyStoreConnection | null {
+-    const stmt = this.db.prepare("SELECT * FROM shopify_stores WHERE workspace_id = $workspaceId AND id = $storeId LIMIT 1");
+-    stmt.bind({ $workspaceId: workspaceId, $storeId: storeId });
+-    const store = stmt.step() ? this.mapShopifyStoreRow(stmt.getAsObject()) : null;
+-    stmt.free();
++  public async getShopifyStoreById(workspaceId: string, storeId: string): Promise<ShopifyStoreConnection | null> {
++    const row = await this.dbGet<any>("SELECT * FROM shopify_stores WHERE workspace_id = $workspaceId AND id = $storeId LIMIT 1", { $workspaceId: workspaceId, $storeId: storeId });
++    const store = row ? this.mapShopifyStoreRow(row) : null;
+     return store;
+   }
+ 
+-  public saveShopifyStore(
++  /**
++   * PHASE 3 SECURITY HARDENING: Shopify and social-platform OAuth access/refresh
++   * tokens were previously stored as plaintext in shopify_stores and
++   * social_accounts. These helpers apply the same AES-256-GCM encryption
++   * already used for AI provider API keys (server/encryption.ts), so no
++   * plaintext token remains in the database. Returns {value: null, iv: null}
++   * for an absent token so callers can write NULL cleanly.
++   */
++  private encryptTokenField(plainToken: string | undefined | null): { value: string | null; iv: string | null } {
++    if (!plainToken) {
++      return { value: null, iv: null };
++    }
++    const { encrypted, iv } = encrypt(plainToken);
++    return { value: encrypted, iv };
++  }
++
++  private decryptTokenField(encryptedValue: string | null | undefined, iv: string | null | undefined): string | undefined {
++    if (!encryptedValue || !iv) {
++      // Not encrypted (or absent) — return as-is. This also transparently
++      // handles any pre-existing plaintext rows written before this fix
++      // (no _iv value present), avoiding a hard migration requirement.
++      return encryptedValue || undefined;
++    }
++    try {
++      return decrypt(encryptedValue, iv);
++    } catch (err) {
++      logger.error({ event: "token_decrypt_failed" }, "Failed to decrypt a stored OAuth token; treating as unavailable.");
++      return undefined;
++    }
++  }
++
++  public async saveShopifyStore(
+     workspaceId: string,
+     input: Omit<ShopifyStoreConnection, "id" | "workspaceId" | "connectedAt" | "updatedAt" | "isDefault">
+-  ): ShopifyStoreConnection {
++  ): Promise<ShopifyStoreConnection> {
+     const now = new Date().toISOString();
+-    const existing = this.getShopifyStores(workspaceId).find((item) => item.shopDomain === input.shopDomain);
+-    const isDefault = this.getShopifyStores(workspaceId).length === 0 || input.status === "connected";
++    const existingStores = await this.getShopifyStores(workspaceId);
++    const existing = existingStores.find((item) => item.shopDomain === input.shopDomain);
++    const isDefault = existingStores.length === 0 || input.status === "connected";
+ 
+     if (existing) {
+-      this.db.run(
++      const encryptedAccess = this.encryptTokenField(input.accessToken);
++      const encryptedRefresh = this.encryptTokenField(input.refreshToken);
++      await this.dbRun(
+         `UPDATE shopify_stores
+          SET shop_name = $shopName,
+              access_token = $accessToken,
++             access_token_iv = $accessTokenIv,
+              refresh_token = $refreshToken,
++             refresh_token_iv = $refreshTokenIv,
+              token_expires_at = $tokenExpiresAt,
+              last_token_refresh_at = $lastTokenRefreshAt,
+              scopes = $scopes,
+@@ -3066,8 +2591,10 @@
+           $workspaceId: workspaceId,
+           $id: existing.id,
+           $shopName: input.shopName,
+-          $accessToken: input.accessToken || null,
+-          $refreshToken: input.refreshToken || null,
++          $accessToken: encryptedAccess.value,
++          $accessTokenIv: encryptedAccess.iv,
++          $refreshToken: encryptedRefresh.value,
++          $refreshTokenIv: encryptedRefresh.iv,
+           $tokenExpiresAt: input.tokenExpiresAt || null,
+           $lastTokenRefreshAt: input.lastTokenRefreshAt || null,
+           $scopes: JSON.stringify(input.scopes),
+@@ -3077,8 +2604,8 @@
+           $lastSyncedAt: input.lastSyncedAt || null,
+         }
+       );
+-      const updated = this.getShopifyStoreById(workspaceId, existing.id);
+-      this.saveToDisk();
++      const updated = await this.getShopifyStoreById(workspaceId, existing.id);
++      await this.saveToDisk();
+       return updated as ShopifyStoreConnection;
+     }
+ 
+@@ -3092,15 +2619,17 @@
+     };
+ 
+     if (isDefault) {
+-      this.db.run("UPDATE shopify_stores SET is_default = 0 WHERE workspace_id = $workspaceId", { $workspaceId: workspaceId });
++      await this.dbRun("UPDATE shopify_stores SET is_default = 0 WHERE workspace_id = $workspaceId", { $workspaceId: workspaceId });
+     }
+ 
+-    this.db.run(
++    const insertEncryptedAccess = this.encryptTokenField(store.accessToken);
++    const insertEncryptedRefresh = this.encryptTokenField(store.refreshToken);
++    await this.dbRun(
+       `INSERT INTO shopify_stores (
+-        id, workspace_id, shop_domain, shop_name, access_token, refresh_token, token_expires_at,
++        id, workspace_id, shop_domain, shop_name, access_token, access_token_iv, refresh_token, refresh_token_iv, token_expires_at,
+         last_token_refresh_at, scopes, status, connection_mode, is_default, connected_at, updated_at, last_synced_at
+       ) VALUES (
+-        $id, $workspaceId, $shopDomain, $shopName, $accessToken, $refreshToken, $tokenExpiresAt,
++        $id, $workspaceId, $shopDomain, $shopName, $accessToken, $accessTokenIv, $refreshToken, $refreshTokenIv, $tokenExpiresAt,
+         $lastTokenRefreshAt, $scopes, $status, $connectionMode, $isDefault, $connectedAt, $updatedAt, $lastSyncedAt
+       )`,
+       {
+@@ -3108,8 +2637,10 @@
+         $workspaceId: workspaceId,
+         $shopDomain: store.shopDomain,
+         $shopName: store.shopName,
+-        $accessToken: store.accessToken || null,
+-        $refreshToken: store.refreshToken || null,
++        $accessToken: insertEncryptedAccess.value,
++        $accessTokenIv: insertEncryptedAccess.iv,
++        $refreshToken: insertEncryptedRefresh.value,
++        $refreshTokenIv: insertEncryptedRefresh.iv,
+         $tokenExpiresAt: store.tokenExpiresAt || null,
+         $lastTokenRefreshAt: store.lastTokenRefreshAt || null,
+         $scopes: JSON.stringify(store.scopes),
+@@ -3122,19 +2653,19 @@
+       }
+     );
+ 
+-    this.saveShopifyAutomationSettings(workspaceId, store.id, {
++    await this.saveShopifyAutomationSettings(workspaceId, store.id, {
+       autoSyncEveryHour: true,
+       autoPublishGeneratedContent: false,
+       autoCreateSocialPosts: false,
+       autoGenerateVideos: false,
+       autoCompetitorMonitoring: false,
+     });
+-    this.logAudit(workspaceId, "SHOPIFY_STORE_CONNECTED", `Connected Shopify store ${store.shopDomain}.`);
+-    this.saveToDisk();
++    await this.logAudit(workspaceId, "SHOPIFY_STORE_CONNECTED", `Connected Shopify store ${store.shopDomain}.`);
++    await this.saveToDisk();
+     return store;
+   }
+ 
+-  public updateShopifyStore(
++  public async updateShopifyStore(
+     workspaceId: string,
+     storeId: string,
+     patch: Partial<Pick<
+@@ -3150,19 +2681,23 @@
+       | "isDefault"
+       | "lastSyncedAt"
+     >>
+-  ): ShopifyStoreConnection | null {
+-    const existing = this.getShopifyStoreById(workspaceId, storeId);
++  ): Promise<ShopifyStoreConnection | null> {
++    const existing = await this.getShopifyStoreById(workspaceId, storeId);
+     if (!existing) {
+       return null;
+     }
+     if (patch.isDefault) {
+-      this.db.run("UPDATE shopify_stores SET is_default = 0 WHERE workspace_id = $workspaceId", { $workspaceId: workspaceId });
++      await this.dbRun("UPDATE shopify_stores SET is_default = 0 WHERE workspace_id = $workspaceId", { $workspaceId: workspaceId });
+     }
+-    this.db.run(
++    const updateEncryptedAccess = this.encryptTokenField(patch.accessToken ?? existing.accessToken);
++    const updateEncryptedRefresh = this.encryptTokenField(patch.refreshToken ?? existing.refreshToken);
++    await this.dbRun(
+       `UPDATE shopify_stores
+        SET shop_name = $shopName,
+            access_token = $accessToken,
++           access_token_iv = $accessTokenIv,
+            refresh_token = $refreshToken,
++           refresh_token_iv = $refreshTokenIv,
+            token_expires_at = $tokenExpiresAt,
+            last_token_refresh_at = $lastTokenRefreshAt,
+            scopes = $scopes,
+@@ -3176,8 +2711,10 @@
+         $workspaceId: workspaceId,
+         $storeId: storeId,
+         $shopName: patch.shopName ?? existing.shopName,
+-        $accessToken: patch.accessToken ?? existing.accessToken ?? null,
+-        $refreshToken: patch.refreshToken ?? existing.refreshToken ?? null,
++        $accessToken: updateEncryptedAccess.value,
++        $accessTokenIv: updateEncryptedAccess.iv,
++        $refreshToken: updateEncryptedRefresh.value,
++        $refreshTokenIv: updateEncryptedRefresh.iv,
+         $tokenExpiresAt: patch.tokenExpiresAt ?? existing.tokenExpiresAt ?? null,
+         $lastTokenRefreshAt: patch.lastTokenRefreshAt ?? existing.lastTokenRefreshAt ?? null,
+         $scopes: JSON.stringify(patch.scopes ?? existing.scopes),
+@@ -3188,13 +2725,13 @@
+         $lastSyncedAt: patch.lastSyncedAt ?? existing.lastSyncedAt ?? null,
+       }
+     );
+-    this.saveToDisk();
+-    return this.getShopifyStoreById(workspaceId, storeId);
++    await this.saveToDisk();
++    return await this.getShopifyStoreById(workspaceId, storeId);
+   }
+ 
+-  public disconnectShopifyStore(workspaceId: string, storeId: string): ShopifyStoreConnection | null {
+-    this.logAudit(workspaceId, "SHOPIFY_STORE_DISCONNECTED", `Disconnected Shopify store ${storeId}.`);
+-    return this.updateShopifyStore(workspaceId, storeId, {
++  public async disconnectShopifyStore(workspaceId: string, storeId: string): Promise<ShopifyStoreConnection | null> {
++    await this.logAudit(workspaceId, "SHOPIFY_STORE_DISCONNECTED", `Disconnected Shopify store ${storeId}.`);
++    return await this.updateShopifyStore(workspaceId, storeId, {
+       status: "disconnected",
+       accessToken: undefined,
+       refreshToken: undefined,
+@@ -3202,15 +2739,15 @@
+     });
+   }
+ 
+-  public saveShopifyAutomationSettings(
++  public async saveShopifyAutomationSettings(
+     workspaceId: string,
+     storeId: string,
+     patch: Partial<Omit<ShopifyAutomationSettings, "id" | "workspaceId" | "storeId" | "updatedAt">>
+-  ): ShopifyAutomationSettings {
+-    const existing = this.getShopifyAutomationSettings(workspaceId, storeId);
++  ): Promise<ShopifyAutomationSettings> {
++    const existing = await this.getShopifyAutomationSettings(workspaceId, storeId);
+     const now = new Date().toISOString();
+     if (existing) {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE shopify_automation_settings
+          SET auto_sync_every_hour = $autoSyncEveryHour,
+              auto_publish_generated_content = $autoPublishGeneratedContent,
+@@ -3234,8 +2771,8 @@
+           $updatedAt: now,
+         }
+       );
+-      this.saveToDisk();
+-      return this.getShopifyAutomationSettings(workspaceId, storeId) as ShopifyAutomationSettings;
++      await this.saveToDisk();
++      return await this.getShopifyAutomationSettings(workspaceId, storeId) as ShopifyAutomationSettings;
+     }
+ 
+     const settings: ShopifyAutomationSettings = {
+@@ -3251,7 +2788,7 @@
+       lastAutomationRunAt: patch.lastAutomationRunAt,
+       updatedAt: now,
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO shopify_automation_settings (
+         id, workspace_id, store_id, auto_sync_every_hour, auto_publish_generated_content,
+         auto_create_social_posts, auto_generate_videos, auto_competitor_monitoring,
+@@ -3275,32 +2812,28 @@
+         $updatedAt: settings.updatedAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return settings;
+   }
+ 
+-  public getShopifyAutomationSettings(workspaceId: string, storeId: string): ShopifyAutomationSettings | null {
+-    const stmt = this.db.prepare(
++  public async getShopifyAutomationSettings(workspaceId: string, storeId: string): Promise<ShopifyAutomationSettings | null> {
++    const row = await this.dbGet<any>(
+       "SELECT * FROM shopify_automation_settings WHERE workspace_id = $workspaceId AND store_id = $storeId LIMIT 1"
+-    );
+-    stmt.bind({ $workspaceId: workspaceId, $storeId: storeId });
+-    const settings = stmt.step() ? this.mapShopifyAutomationSettingsRow(stmt.getAsObject()) : null;
+-    stmt.free();
++    , { $workspaceId: workspaceId, $storeId: storeId });
++    const settings = row ? this.mapShopifyAutomationSettingsRow(row) : null;
+     return settings;
+   }
+ 
+-  public getAllShopifyAutomationSettings(workspaceId: string): ShopifyAutomationSettings[] {
+-    const stmt = this.db.prepare("SELECT * FROM shopify_automation_settings WHERE workspace_id = $workspaceId ORDER BY updated_at DESC");
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getAllShopifyAutomationSettings(workspaceId: string): Promise<ShopifyAutomationSettings[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM shopify_automation_settings WHERE workspace_id = $workspaceId ORDER BY updated_at DESC", { $workspaceId: workspaceId });
+     const settings: ShopifyAutomationSettings[] = [];
+-    while (stmt.step()) {
+-      settings.push(this.mapShopifyAutomationSettingsRow(stmt.getAsObject()));
++    for (const row of rows) {
++      settings.push(this.mapShopifyAutomationSettingsRow(row));
+     }
+-    stmt.free();
+     return settings;
+   }
+ 
+-  public enqueueShopifySyncJob(
++  public async enqueueShopifySyncJob(
+     workspaceId: string,
+     storeId: string,
+     scope: ShopifySyncScope,
+@@ -3308,7 +2841,7 @@
+     summary: string,
+     webhookTopic?: ShopifyWebhookTopic,
+     entityId?: string
+-  ): ShopifySyncJob {
++  ): Promise<ShopifySyncJob> {
+     const now = new Date().toISOString();
+     const job: ShopifySyncJob = {
+       id: uuidv4(),
+@@ -3330,7 +2863,7 @@
+       createdAt: now,
+       updatedAt: now,
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO shopify_sync_jobs (
+         id, workspace_id, store_id, scope, status, trigger_source, webhook_topic, entity_id,
+         summary, synced_products, synced_collections, synced_inventory, imported_orders,
+@@ -3354,19 +2887,17 @@
+         $updatedAt: job.updatedAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return job;
+   }
+ 
+-  public updateShopifySyncJob(
++  public async updateShopifySyncJob(
+     workspaceId: string,
+     jobId: string,
+     patch: Partial<Omit<ShopifySyncJob, "id" | "workspaceId" | "storeId" | "scope" | "trigger" | "createdAt">>
+-  ): ShopifySyncJob | null {
+-    const stmt = this.db.prepare("SELECT * FROM shopify_sync_jobs WHERE workspace_id = $workspaceId AND id = $jobId LIMIT 1");
+-    stmt.bind({ $workspaceId: workspaceId, $jobId: jobId });
+-    const existing = stmt.step() ? this.mapShopifySyncJobRow(stmt.getAsObject()) : null;
+-    stmt.free();
++  ): Promise<ShopifySyncJob | null> {
++    const row = await this.dbGet<any>("SELECT * FROM shopify_sync_jobs WHERE workspace_id = $workspaceId AND id = $jobId LIMIT 1", { $workspaceId: workspaceId, $jobId: jobId });
++    const existing = row ? this.mapShopifySyncJobRow(row) : null;
+     if (!existing) {
+       return null;
+     }
+@@ -3375,7 +2906,7 @@
+       ...patch,
+       updatedAt: new Date().toISOString(),
+     };
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE shopify_sync_jobs
+        SET status = $status,
+            webhook_topic = $webhookTopic,
+@@ -3413,14 +2944,15 @@
+         $updatedAt: next.updatedAt,
+       }
+     );
+-    this.saveToDisk();
+-    return this.getShopifySyncJobs(workspaceId).find((item) => item.id === jobId) || null;
++    await this.saveToDisk();
++    const jobs = await this.getShopifySyncJobs(workspaceId);
++    return jobs.find((item) => item.id === jobId) || null;
+   }
+ 
+-  public getShopifySyncJobs(
++  public async getShopifySyncJobs(
+     workspaceId: string,
+     options: { storeId?: string; status?: ShopifySyncStatus } = {}
+-  ): ShopifySyncJob[] {
++  ): Promise<ShopifySyncJob[]> {
+     let query = "SELECT * FROM shopify_sync_jobs WHERE workspace_id = $workspaceId";
+     const params: Record<string, string> = { $workspaceId: workspaceId };
+     if (options.storeId) {
+@@ -3432,17 +2964,15 @@
+       params.$status = options.status;
+     }
+     query += " ORDER BY created_at DESC";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const jobs: ShopifySyncJob[] = [];
+-    while (stmt.step()) {
+-      jobs.push(this.mapShopifySyncJobRow(stmt.getAsObject()));
++    for (const row of rows) {
++      jobs.push(this.mapShopifySyncJobRow(row));
+     }
+-    stmt.free();
+     return jobs;
+   }
+ 
+-  public saveShopifyWebhookEvent(
++  public async saveShopifyWebhookEvent(
+     workspaceId: string,
+     storeId: string,
+     topic: ShopifyWebhookTopic,
+@@ -3450,7 +2980,7 @@
+     syncJobId?: string,
+     status: ShopifySyncStatus = "pending",
+     errorMessage?: string
+-  ): ShopifyWebhookEvent {
++  ): Promise<ShopifyWebhookEvent> {
+     const event: ShopifyWebhookEvent = {
+       id: uuidv4(),
+       workspaceId,
+@@ -3462,7 +2992,7 @@
+       errorMessage,
+       createdAt: new Date().toISOString(),
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO shopify_webhook_events (
+         id, workspace_id, store_id, topic, status, payload, sync_job_id, error_message, created_at
+       ) VALUES (
+@@ -3480,11 +3010,11 @@
+         $createdAt: event.createdAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return event;
+   }
+ 
+-  public getShopifyWebhookEvents(workspaceId: string, storeId?: string): ShopifyWebhookEvent[] {
++  public async getShopifyWebhookEvents(workspaceId: string, storeId?: string): Promise<ShopifyWebhookEvent[]> {
+     let query = "SELECT * FROM shopify_webhook_events WHERE workspace_id = $workspaceId";
+     const params: Record<string, string> = { $workspaceId: workspaceId };
+     if (storeId) {
+@@ -3492,24 +3022,22 @@
+       params.$storeId = storeId;
+     }
+     query += " ORDER BY created_at DESC";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const events: ShopifyWebhookEvent[] = [];
+-    while (stmt.step()) {
+-      events.push(this.mapShopifyWebhookEventRow(stmt.getAsObject()));
++    for (const row of rows) {
++      events.push(this.mapShopifyWebhookEventRow(row));
+     }
+-    stmt.free();
+     return events;
+   }
+ 
+-  public saveShopifyAutomationRun(
++  public async saveShopifyAutomationRun(
+     workspaceId: string,
+     storeId: string,
+     action: ShopifyAutomationRun["action"],
+     status: ShopifySyncStatus,
+     detail: string,
+     productId?: string
+-  ): ShopifyAutomationRun {
++  ): Promise<ShopifyAutomationRun> {
+     const run: ShopifyAutomationRun = {
+       id: uuidv4(),
+       workspaceId,
+@@ -3520,7 +3048,7 @@
+       productId,
+       createdAt: new Date().toISOString(),
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO shopify_automation_runs (id, workspace_id, store_id, action, status, detail, product_id, created_at)
+        VALUES ($id, $workspaceId, $storeId, $action, $status, $detail, $productId, $createdAt)`,
+       {
+@@ -3534,14 +3062,14 @@
+         $createdAt: run.createdAt,
+       }
+     );
+-    this.saveShopifyAutomationSettings(workspaceId, storeId, {
++    await this.saveShopifyAutomationSettings(workspaceId, storeId, {
+       lastAutomationRunAt: run.createdAt,
+     });
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return run;
+   }
+ 
+-  public getShopifyAutomationRuns(workspaceId: string, storeId?: string): ShopifyAutomationRun[] {
++  public async getShopifyAutomationRuns(workspaceId: string, storeId?: string): Promise<ShopifyAutomationRun[]> {
+     let query = "SELECT * FROM shopify_automation_runs WHERE workspace_id = $workspaceId";
+     const params: Record<string, string> = { $workspaceId: workspaceId };
+     if (storeId) {
+@@ -3549,44 +3077,39 @@
+       params.$storeId = storeId;
+     }
+     query += " ORDER BY created_at DESC";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const runs: ShopifyAutomationRun[] = [];
+-    while (stmt.step()) {
+-      runs.push(this.mapShopifyAutomationRunRow(stmt.getAsObject()));
++    for (const row of rows) {
++      runs.push(this.mapShopifyAutomationRunRow(row));
+     }
+-    stmt.free();
+     return runs;
+   }
+ 
+-  public markShopifyStoreSynced(workspaceId: string, storeId: string): void {
+-    this.updateShopifyStore(workspaceId, storeId, {
++  public async markShopifyStoreSynced(workspaceId: string, storeId: string): Promise<void> {
++    await this.updateShopifyStore(workspaceId, storeId, {
+       lastSyncedAt: new Date().toISOString(),
+       status: "connected",
+     });
+   }
+ 
+-  public upsertShopifyProductRecord(
++  public async upsertShopifyProductRecord(
+     workspaceId: string,
+     storeId: string,
+     shopifyProductId: string,
+     handle: string | undefined,
+     inventoryQuantity: number,
+     product: NormalizedProduct
+-  ): NormalizedProduct {
++  ): Promise<NormalizedProduct> {
+     const now = new Date().toISOString();
+-    const stmt = this.db.prepare(
+-      "SELECT * FROM shopify_product_links WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_product_id = $shopifyProductId LIMIT 1"
++    const row = await this.dbGet<any>(
++      "SELECT * FROM shopify_product_links WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_product_id = $shopifyProductId LIMIT 1",
++      { $workspaceId: workspaceId, $storeId: storeId, $shopifyProductId: shopifyProductId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId, $storeId: storeId, $shopifyProductId: shopifyProductId });
+-    const hasLink = stmt.step();
+-    const row = hasLink ? stmt.getAsObject() : null;
+-    stmt.free();
+ 
+     let productId = row?.product_id as string | undefined;
+     if (!productId) {
+       productId = uuidv4();
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO products (
+           id, workspace_id, title, description, images, gallery, variants, specifications, vendor,
+           price, compare_at_price, currency, availability, created_at
+@@ -3611,7 +3134,7 @@
+           $createdAt: now,
+         }
+       );
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO shopify_product_links (
+           id, workspace_id, store_id, product_id, shopify_product_id, handle, inventory_quantity, updated_at
+         ) VALUES (
+@@ -3629,7 +3152,7 @@
+         }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE products
+          SET title = $title,
+              description = $description,
+@@ -3659,7 +3182,7 @@
+           $availability: product.availability ? 1 : 0,
+         }
+       );
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE shopify_product_links
+          SET handle = $handle,
+              inventory_quantity = $inventoryQuantity,
+@@ -3675,35 +3198,32 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return { ...product, id: productId };
+   }
+ 
+-  public upsertShopifyCollectionRecord(
++  public async upsertShopifyCollectionRecord(
+     workspaceId: string,
+     storeId: string,
+     shopifyCollectionId: string,
+     title: string,
+     handle: string | undefined,
+     productsCount: number
+-  ): void {
++  ): Promise<void> {
+     const now = new Date().toISOString();
+-    const stmt = this.db.prepare(
+-      "SELECT id FROM shopify_collections WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_collection_id = $shopifyCollectionId LIMIT 1"
++    const row = await this.dbGet<any>(
++      "SELECT id FROM shopify_collections WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_collection_id = $shopifyCollectionId LIMIT 1",
++      { $workspaceId: workspaceId, $storeId: storeId, $shopifyCollectionId: shopifyCollectionId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId, $storeId: storeId, $shopifyCollectionId: shopifyCollectionId });
+-    const exists = stmt.step();
+-    const row = exists ? stmt.getAsObject() : null;
+-    stmt.free();
+     if (row?.id) {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE shopify_collections
+          SET title = $title, handle = $handle, products_count = $productsCount, updated_at = $updatedAt
+          WHERE id = $id`,
+         { $id: row.id, $title: title, $handle: handle || null, $productsCount: productsCount, $updatedAt: now }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO shopify_collections (
+           id, workspace_id, store_id, shopify_collection_id, title, handle, products_count, updated_at
+         ) VALUES (
+@@ -3721,10 +3241,10 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public upsertShopifyOrderRecord(
++  public async upsertShopifyOrderRecord(
+     workspaceId: string,
+     storeId: string,
+     shopifyOrderId: string,
+@@ -3733,17 +3253,14 @@
+     totalPrice: number,
+     currency: string,
+     status: string
+-  ): void {
++  ): Promise<void> {
+     const now = new Date().toISOString();
+-    const stmt = this.db.prepare(
+-      "SELECT id FROM shopify_orders WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_order_id = $shopifyOrderId LIMIT 1"
++    const row = await this.dbGet<any>(
++      "SELECT id FROM shopify_orders WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_order_id = $shopifyOrderId LIMIT 1",
++      { $workspaceId: workspaceId, $storeId: storeId, $shopifyOrderId: shopifyOrderId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId, $storeId: storeId, $shopifyOrderId: shopifyOrderId });
+-    const exists = stmt.step();
+-    const row = exists ? stmt.getAsObject() : null;
+-    stmt.free();
+     if (row?.id) {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE shopify_orders
+          SET order_number = $orderNumber, customer_email = $customerEmail, total_price = $totalPrice,
+              currency = $currency, status = $status, updated_at = $updatedAt
+@@ -3759,7 +3276,7 @@
+         }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO shopify_orders (
+           id, workspace_id, store_id, shopify_order_id, order_number, customer_email,
+           total_price, currency, status, created_at, updated_at
+@@ -3782,10 +3299,10 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public upsertShopifyCustomerRecord(
++  public async upsertShopifyCustomerRecord(
+     workspaceId: string,
+     storeId: string,
+     shopifyCustomerId: string,
+@@ -3794,17 +3311,14 @@
+     lastName: string | undefined,
+     ordersCount: number,
+     totalSpent: number
+-  ): void {
++  ): Promise<void> {
+     const now = new Date().toISOString();
+-    const stmt = this.db.prepare(
+-      "SELECT id FROM shopify_customers WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_customer_id = $shopifyCustomerId LIMIT 1"
++    const row = await this.dbGet<any>(
++      "SELECT id FROM shopify_customers WHERE workspace_id = $workspaceId AND store_id = $storeId AND shopify_customer_id = $shopifyCustomerId LIMIT 1",
++      { $workspaceId: workspaceId, $storeId: storeId, $shopifyCustomerId: shopifyCustomerId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId, $storeId: storeId, $shopifyCustomerId: shopifyCustomerId });
+-    const exists = stmt.step();
+-    const row = exists ? stmt.getAsObject() : null;
+-    stmt.free();
+     if (row?.id) {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE shopify_customers
+          SET email = $email, first_name = $firstName, last_name = $lastName,
+              orders_count = $ordersCount, total_spent = $totalSpent, updated_at = $updatedAt
+@@ -3820,7 +3334,7 @@
+         }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO shopify_customers (
+           id, workspace_id, store_id, shopify_customer_id, email, first_name, last_name,
+           orders_count, total_spent, updated_at
+@@ -3842,18 +3356,29 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getShopifySyncAnalytics(workspaceId: string): ShopifySyncAnalytics {
+-    const stores = this.getShopifyStores(workspaceId).filter((store) => store.status !== "disconnected");
+-    const jobs = this.getShopifySyncJobs(workspaceId);
+-    const automationRuns = this.getShopifyAutomationRuns(workspaceId);
+-    const productCountResult = this.db.exec(`SELECT COUNT(*) AS c FROM shopify_product_links WHERE workspace_id = '${workspaceId}'`);
+-    const ordersResult = this.db.exec(`SELECT COUNT(*) AS c, COALESCE(SUM(total_price), 0) AS revenue FROM shopify_orders WHERE workspace_id = '${workspaceId}'`);
+-    const syncedProducts = productCountResult[0]?.values?.[0]?.[0] ?? 0;
+-    const ordersImported = ordersResult[0]?.values?.[0]?.[0] ?? 0;
+-    const revenueImported = ordersResult[0]?.values?.[0]?.[1] ?? 0;
++  public async getShopifySyncAnalytics(workspaceId: string): Promise<ShopifySyncAnalytics> {
++    const allStores = await this.getShopifyStores(workspaceId);
++    const stores = allStores.filter((store) => store.status !== "disconnected");
++    const jobs = await this.getShopifySyncJobs(workspaceId);
++    const automationRuns = await this.getShopifyAutomationRuns(workspaceId);
++    // SECURITY FIX (Phase 2 cutover): previously interpolated workspaceId directly into
++    // a raw SQL string executed against the old sql.js handle - a SQL injection risk,
++    // even though workspaceId originates from server-trusted context today. Now uses a
++    // real parameterized query like every other method in this class.
++    const productCountRow = await this.dbGet<{ c: number }>(
++      "SELECT COUNT(*) AS c FROM shopify_product_links WHERE workspace_id = $workspaceId",
++      { $workspaceId: workspaceId }
++    );
++    const ordersRow = await this.dbGet<{ c: number; revenue: number }>(
++      "SELECT COUNT(*) AS c, COALESCE(SUM(total_price), 0) AS revenue FROM shopify_orders WHERE workspace_id = $workspaceId",
++      { $workspaceId: workspaceId }
++    );
++    const syncedProducts = productCountRow?.c ?? 0;
++    const ordersImported = ordersRow?.c ?? 0;
++    const revenueImported = ordersRow?.revenue ?? 0;
+     return {
+       connectedStores: stores.length,
+       syncedProducts: Number(syncedProducts),
+@@ -3864,16 +3389,16 @@
+     };
+   }
+ 
+-  public getShopifySyncOverview(workspaceId: string): ShopifySyncOverview {
+-    const jobs = this.getShopifySyncJobs(workspaceId);
++  public async getShopifySyncOverview(workspaceId: string): Promise<ShopifySyncOverview> {
++    const jobs = await this.getShopifySyncJobs(workspaceId);
+     return {
+-      stores: this.getShopifyStores(workspaceId),
++      stores: await this.getShopifyStores(workspaceId),
+       jobs,
+       queue: jobs.filter((job) => job.status === "pending" || job.status === "syncing"),
+-      webhooks: this.getShopifyWebhookEvents(workspaceId),
+-      automationSettings: this.getAllShopifyAutomationSettings(workspaceId),
+-      automationRuns: this.getShopifyAutomationRuns(workspaceId),
+-      analytics: this.getShopifySyncAnalytics(workspaceId),
++      webhooks: await this.getShopifyWebhookEvents(workspaceId),
++      automationSettings: await this.getAllShopifyAutomationSettings(workspaceId),
++      automationRuns: await this.getShopifyAutomationRuns(workspaceId),
++      analytics: await this.getShopifySyncAnalytics(workspaceId),
+     };
+   }
+ 
+@@ -3941,7 +3466,7 @@
+     };
+   }
+ 
+-  public enqueueQueueJob(
++  public async enqueueQueueJob(
+     workspaceId: string,
+     input: {
+       kind: QueueJobKind;
+@@ -3953,7 +3478,7 @@
+       backoffMs?: number;
+       status?: Extract<QueueJobStatus, "pending" | "queued">;
+     }
+-  ): QueueJobRecord {
++  ): Promise<QueueJobRecord> {
+     const now = new Date().toISOString();
+     const job: QueueJobRecord = {
+       id: uuidv4(),
+@@ -3971,7 +3496,7 @@
+       createdAt: now,
+       updatedAt: now,
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO queue_jobs (
+         id, workspace_id, kind, worker_name, status, reference_id, payload, priority,
+         attempt_count, max_attempts, backoff_ms, next_run_at, locked_at, last_error,
+@@ -3996,20 +3521,18 @@
+         $updatedAt: job.updatedAt,
+       }
+     );
+-    this.addQueueJobLog(workspaceId, job.id, job.workerName, job.status, `Queued ${job.kind} job.`);
+-    this.saveToDisk();
++    await this.addQueueJobLog(workspaceId, job.id, job.workerName, job.status, `Queued ${job.kind} job.`);
++    await this.saveToDisk();
+     return job;
+   }
+ 
+-  public getQueueJobById(jobId: string): QueueJobRecord | null {
+-    const stmt = this.db.prepare("SELECT * FROM queue_jobs WHERE id = $jobId LIMIT 1");
+-    stmt.bind({ $jobId: jobId });
+-    const job = stmt.step() ? this.mapQueueJobRow(stmt.getAsObject()) : null;
+-    stmt.free();
++  public async getQueueJobById(jobId: string): Promise<QueueJobRecord | null> {
++    const row = await this.dbGet<any>("SELECT * FROM queue_jobs WHERE id = $jobId LIMIT 1", { $jobId: jobId });
++    const job = row ? this.mapQueueJobRow(row) : null;
+     return job;
+   }
+ 
+-  public getQueueJobs(
++  public async getQueueJobs(
+     workspaceId?: string,
+     options: {
+       statuses?: QueueJobStatus[];
+@@ -4018,7 +3541,7 @@
+       includeCompleted?: boolean;
+       limit?: number;
+     } = {}
+-  ): QueueJobRecord[] {
++  ): Promise<QueueJobRecord[]> {
+     let query = "SELECT * FROM queue_jobs WHERE 1=1";
+     const params: Record<string, any> = {};
+     if (workspaceId) {
+@@ -4049,23 +3572,22 @@
+     if (options.limit) {
+       query += ` LIMIT ${options.limit}`;
+     }
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const jobs: QueueJobRecord[] = [];
+-    while (stmt.step()) {
+-      jobs.push(this.mapQueueJobRow(stmt.getAsObject()));
++    for (const row of rows) {
++      jobs.push(this.mapQueueJobRow(row));
+     }
+-    stmt.free();
+     return jobs;
+   }
+ 
+-  public claimNextQueueJob(workerName: QueueWorkerName, kinds: QueueJobKind[]): QueueJobRecord | null {
+-    const dueJobs = this.getQueueJobs(undefined, {
++  public async claimNextQueueJob(workerName: QueueWorkerName, kinds: QueueJobKind[]): Promise<QueueJobRecord | null> {
++    const candidateJobs = await this.getQueueJobs(undefined, {
+       statuses: ["pending", "queued", "retrying"],
+       kinds,
+       includeCompleted: true,
+       limit: 200,
+-    }).filter((job) => new Date(job.nextRunAt).getTime() <= Date.now());
++    });
++    const dueJobs = candidateJobs.filter((job) => new Date(job.nextRunAt).getTime() <= Date.now());
+ 
+     const next = dueJobs
+       .sort((a, b) => (b.priority - a.priority) || (new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()))[0];
+@@ -4074,7 +3596,7 @@
+       return null;
+     }
+ 
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE queue_jobs
+        SET status = 'processing',
+            attempt_count = attempt_count + 1,
+@@ -4087,12 +3609,12 @@
+         $updatedAt: new Date().toISOString(),
+       }
+     );
+-    this.addQueueJobLog(next.workspaceId, next.id, workerName, "processing", `Worker ${workerName} claimed ${next.kind} job.`);
+-    this.saveToDisk();
+-    return this.getQueueJobById(next.id);
++    await this.addQueueJobLog(next.workspaceId, next.id, workerName, "processing", `Worker ${workerName} claimed ${next.kind} job.`);
++    await this.saveToDisk();
++    return await this.getQueueJobById(next.id);
+   }
+ 
+-  public updateQueueJob(
++  public async updateQueueJob(
+     jobId: string,
+     patch: Partial<Pick<
+       QueueJobRecord,
+@@ -4109,8 +3631,8 @@
+       | "processingTimeMs"
+       | "completedAt"
+     >>
+-  ): QueueJobRecord | null {
+-    const existing = this.getQueueJobById(jobId);
++  ): Promise<QueueJobRecord | null> {
++    const existing = await this.getQueueJobById(jobId);
+     if (!existing) {
+       return null;
+     }
+@@ -4119,7 +3641,7 @@
+       ...patch,
+       updatedAt: new Date().toISOString(),
+     };
+-    this.db.run(
++    await this.dbRun(
+       `UPDATE queue_jobs
+        SET status = $status,
+            payload = $payload,
+@@ -4152,17 +3674,17 @@
+         $completedAt: next.completedAt || null,
+       }
+     );
+-    this.saveToDisk();
+-    return this.getQueueJobById(jobId);
++    await this.saveToDisk();
++    return await this.getQueueJobById(jobId);
+   }
+ 
+-  public addQueueJobLog(
++  public async addQueueJobLog(
+     workspaceId: string,
+     jobId: string,
+     workerName: QueueWorkerName,
+     status: QueueJobStatus,
+     message: string
+-  ): QueueJobLog {
++  ): Promise<QueueJobLog> {
+     const log: QueueJobLog = {
+       id: uuidv4(),
+       jobId,
+@@ -4172,7 +3694,7 @@
+       workerName,
+       createdAt: new Date().toISOString(),
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO queue_job_logs (id, job_id, workspace_id, status, message, worker_name, created_at)
+        VALUES ($id, $jobId, $workspaceId, $status, $message, $workerName, $createdAt)`,
+       {
+@@ -4185,11 +3707,11 @@
+         $createdAt: log.createdAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return log;
+   }
+ 
+-  public getQueueJobLogs(workspaceId?: string, jobId?: string): QueueJobLog[] {
++  public async getQueueJobLogs(workspaceId?: string, jobId?: string): Promise<QueueJobLog[]> {
+     let query = "SELECT * FROM queue_job_logs WHERE 1=1";
+     const params: Record<string, string> = {};
+     if (workspaceId) {
+@@ -4201,18 +3723,16 @@
+       params.$jobId = jobId;
+     }
+     query += " ORDER BY created_at DESC";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const logs: QueueJobLog[] = [];
+-    while (stmt.step()) {
+-      logs.push(this.mapQueueJobLogRow(stmt.getAsObject()));
++    for (const row of rows) {
++      logs.push(this.mapQueueJobLogRow(row));
+     }
+-    stmt.free();
+     return logs;
+   }
+ 
+-  public moveQueueJobToDeadLetter(jobId: string, reason: string): DeadLetterJob | null {
+-    const job = this.getQueueJobById(jobId);
++  public async moveQueueJobToDeadLetter(jobId: string, reason: string): Promise<DeadLetterJob | null> {
++    const job = await this.getQueueJobById(jobId);
+     if (!job) {
+       return null;
+     }
+@@ -4227,7 +3747,7 @@
+       lastError: reason,
+       movedAt: new Date().toISOString(),
+     };
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO dead_letter_jobs (id, source_job_id, workspace_id, kind, worker_name, payload, attempts, last_error, moved_at)
+        VALUES ($id, $sourceJobId, $workspaceId, $kind, $workerName, $payload, $attempts, $lastError, $movedAt)`,
+       {
+@@ -4242,22 +3762,22 @@
+         $movedAt: dead.movedAt,
+       }
+     );
+-    this.updateQueueJob(jobId, {
++    await this.updateQueueJob(jobId, {
+       status: "failed",
+       deadLetterReason: reason,
+       completedAt: dead.movedAt,
+     });
+-    this.addQueueJobLog(job.workspaceId, job.id, job.workerName, "failed", `Moved job to dead-letter queue: ${reason}`);
+-    this.saveToDisk();
++    await this.addQueueJobLog(job.workspaceId, job.id, job.workerName, "failed", `Moved job to dead-letter queue: ${reason}`);
++    await this.saveToDisk();
+     return dead;
+   }
+ 
+-  public retryQueueJob(jobId: string): QueueJobRecord | null {
+-    const job = this.getQueueJobById(jobId);
++  public async retryQueueJob(jobId: string): Promise<QueueJobRecord | null> {
++    const job = await this.getQueueJobById(jobId);
+     if (!job) {
+       return null;
+     }
+-    const retried = this.updateQueueJob(jobId, {
++    const retried = await this.updateQueueJob(jobId, {
+       status: "queued",
+       nextRunAt: new Date().toISOString(),
+       lockedAt: undefined,
+@@ -4266,23 +3786,23 @@
+       completedAt: undefined,
+     });
+     if (retried) {
+-      this.addQueueJobLog(retried.workspaceId, retried.id, retried.workerName, "queued", "Job manually retried.");
++      await this.addQueueJobLog(retried.workspaceId, retried.id, retried.workerName, "queued", "Job manually retried.");
+     }
+     return retried;
+   }
+ 
+-  public cancelQueueJob(jobId: string): QueueJobRecord | null {
+-    const job = this.updateQueueJob(jobId, {
++  public async cancelQueueJob(jobId: string): Promise<QueueJobRecord | null> {
++    const job = await this.updateQueueJob(jobId, {
+       status: "cancelled",
+       completedAt: new Date().toISOString(),
+     });
+     if (job) {
+-      this.addQueueJobLog(job.workspaceId, job.id, job.workerName, "cancelled", "Job cancelled.");
++      await this.addQueueJobLog(job.workspaceId, job.id, job.workerName, "cancelled", "Job cancelled.");
+     }
+     return job;
+   }
+ 
+-  public getDeadLetterJobs(workspaceId?: string): DeadLetterJob[] {
++  public async getDeadLetterJobs(workspaceId?: string): Promise<DeadLetterJob[]> {
+     let query = "SELECT * FROM dead_letter_jobs";
+     const params: Record<string, string> = {};
+     if (workspaceId) {
+@@ -4290,21 +3810,20 @@
+       params.$workspaceId = workspaceId;
+     }
+     query += " ORDER BY moved_at DESC";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind(params);
++    const rows = await this.dbAll<any>(query, params);
+     const jobs: DeadLetterJob[] = [];
+-    while (stmt.step()) {
+-      jobs.push(this.mapDeadLetterRow(stmt.getAsObject()));
++    for (const row of rows) {
++      jobs.push(this.mapDeadLetterRow(row));
+     }
+-    stmt.free();
+     return jobs;
+   }
+ 
+-  public heartbeatWorker(
++  public async heartbeatWorker(
+     workerName: QueueWorkerName,
+     patch: Omit<WorkerHealthSnapshot, "workerName">
+-  ): WorkerHealthSnapshot {
+-    const existing = this.getQueueWorkers().find((worker) => worker.workerName === workerName);
++  ): Promise<WorkerHealthSnapshot> {
++    const workers = await this.getQueueWorkers();
++    const existing = workers.find((worker) => worker.workerName === workerName);
+     const next: WorkerHealthSnapshot = {
+       workerName,
+       status: patch.status,
+@@ -4317,7 +3836,7 @@
+       lastHeartbeatAt: patch.lastHeartbeatAt,
+     };
+     if (existing) {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE queue_workers
+          SET status = $status,
+              active_job_id = $activeJobId,
+@@ -4341,7 +3860,7 @@
+         }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO queue_workers (
+           worker_name, status, active_job_id, memory_usage_mb, queue_length, failed_jobs,
+           processed_jobs, average_processing_time_ms, last_heartbeat_at
+@@ -4362,22 +3881,21 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+     return next;
+   }
+ 
+-  public getQueueWorkers(): WorkerHealthSnapshot[] {
+-    const stmt = this.db.prepare("SELECT * FROM queue_workers ORDER BY worker_name ASC");
++  public async getQueueWorkers(): Promise<WorkerHealthSnapshot[]> {
++    const rows = await this.dbAll<any>("SELECT * FROM queue_workers ORDER BY worker_name ASC");
+     const workers: WorkerHealthSnapshot[] = [];
+-    while (stmt.step()) {
+-      workers.push(this.mapWorkerHealthRow(stmt.getAsObject()));
++    for (const row of rows) {
++      workers.push(this.mapWorkerHealthRow(row));
+     }
+-    stmt.free();
+     return workers;
+   }
+ 
+-  public getQueueAnalytics(workspaceId?: string): QueueAnalytics {
+-    const jobs = this.getQueueJobs(workspaceId, { includeCompleted: true });
++  public async getQueueAnalytics(workspaceId?: string): Promise<QueueAnalytics> {
++    const jobs = await this.getQueueJobs(workspaceId, { includeCompleted: true });
+     const activeJobs = jobs.filter((job) => job.status === "processing" || job.status === "queued" || job.status === "retrying" || job.status === "pending");
+     const completedJobs = jobs.filter((job) => job.status === "completed");
+     const failedJobs = jobs.filter((job) => job.status === "failed");
+@@ -4417,54 +3935,52 @@
+     };
+   }
+ 
+-  public getQueueOverview(workspaceId?: string): QueueOverview {
+-    const jobs = this.getQueueJobs(workspaceId, { includeCompleted: true });
+-    const workers = this.getQueueWorkers();
++  public async getQueueOverview(workspaceId?: string): Promise<QueueOverview> {
++    const jobs = await this.getQueueJobs(workspaceId, { includeCompleted: true });
++    const workers = await this.getQueueWorkers();
+     return {
+       jobs,
+       activeJobs: jobs.filter((job) => job.status === "pending" || job.status === "queued" || job.status === "retrying" || job.status === "processing"),
+       completedJobs: jobs.filter((job) => job.status === "completed"),
+       failedJobs: jobs.filter((job) => job.status === "failed" || job.status === "cancelled"),
+       workers,
+-      deadLetterJobs: this.getDeadLetterJobs(workspaceId),
+-      analytics: this.getQueueAnalytics(workspaceId),
++      deadLetterJobs: await this.getDeadLetterJobs(workspaceId),
++      analytics: await this.getQueueAnalytics(workspaceId),
+     };
+   }
+ 
+-  public cleanupQueueRecords(
++  public async cleanupQueueRecords(
+     completedRetentionHours = 24,
+     failedRetentionHours = 72,
+     logRetentionHours = 72
+-  ): void {
++  ): Promise<void> {
+     const completedCutoff = new Date(Date.now() - completedRetentionHours * 60 * 60 * 1000).toISOString();
+     const failedCutoff = new Date(Date.now() - failedRetentionHours * 60 * 60 * 1000).toISOString();
+     const logCutoff = new Date(Date.now() - logRetentionHours * 60 * 60 * 1000).toISOString();
+ 
+-    this.db.run(
++    await this.dbRun(
+       "DELETE FROM queue_jobs WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at < $completedCutoff",
+       { $completedCutoff: completedCutoff }
+     );
+-    this.db.run(
++    await this.dbRun(
+       "DELETE FROM queue_jobs WHERE (status = 'failed' OR status = 'cancelled') AND completed_at IS NOT NULL AND completed_at < $failedCutoff",
+       { $failedCutoff: failedCutoff }
+     );
+-    this.db.run(
++    await this.dbRun(
+       "DELETE FROM queue_job_logs WHERE created_at < $logCutoff",
+       { $logCutoff: logCutoff }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+   // ─── NEW: Integration Methods ────────────────────────────────────────
+ 
+-  public getAIProviders(workspaceId: string): AIProviderConfig[] {
+-    const stmt = this.db.prepare(
++  public async getAIProviders(workspaceId: string): Promise<AIProviderConfig[]> {
++    const rows = await this.dbAll<any>(
+       "SELECT provider, is_enabled, priority, default_model, monthly_usage, last_connection_date FROM workspace_ai_providers WHERE workspace_id = $workspaceId ORDER BY priority ASC"
+-    );
+-    stmt.bind({ $workspaceId: workspaceId });
++    , { $workspaceId: workspaceId });
+     const configs: AIProviderConfig[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       configs.push({
+         provider: row.provider as AIProviderName,
+         isEnabled: row.is_enabled === 1,
+@@ -4475,11 +3991,10 @@
+         lastConnectionDate: row.last_connection_date || undefined,
+       });
+     }
+-    stmt.free();
+     return configs;
+   }
+ 
+-  public saveAIProvider(
++  public async saveAIProvider(
+     workspaceId: string,
+     provider: AIProviderName,
+     apiKey: string | null,
+@@ -4488,23 +4003,20 @@
+     defaultModel?: string,
+     monthlyUsage?: number,
+     lastConnectionDate?: string
+-  ): void {
++  ): Promise<void> {
+     const now = new Date().toISOString();
+     const hasKey = apiKey !== null && apiKey !== "";
+     const { encrypted, iv } = hasKey ? encrypt(apiKey!) : { encrypted: "", iv: "" };
+     
+-    const stmt = this.db.prepare(
++    const row = await this.dbGet<any>(
+       "SELECT id, api_key_encrypted, api_key_iv, monthly_usage FROM workspace_ai_providers WHERE workspace_id = $workspaceId AND provider = $provider LIMIT 1"
+-    );
+-    stmt.bind({ $workspaceId: workspaceId, $provider: provider });
+-    const row = stmt.step() ? stmt.getAsObject() : null;
+-    stmt.free();
++    , { $workspaceId: workspaceId, $provider: provider });
+ 
+     if (row) {
+       const keyEncrypted = hasKey ? encrypted : row.api_key_encrypted;
+       const keyIv = hasKey ? iv : row.api_key_iv;
+       
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE workspace_ai_providers
+          SET api_key_encrypted = $apiKeyEncrypted,
+              api_key_iv = $apiKeyIv,
+@@ -4529,7 +4041,7 @@
+         }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO workspace_ai_providers (
+           id, workspace_id, provider, api_key_encrypted, api_key_iv, is_enabled, priority, default_model, monthly_usage, last_connection_date, created_at, updated_at
+         ) VALUES (
+@@ -4551,19 +4063,15 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getAIRouting(workspaceId: string): Record<string, string> {
+-    const stmt = this.db.prepare(
+-      "SELECT ai_routing FROM workspaces WHERE id = $workspaceId LIMIT 1"
++  public async getAIRouting(workspaceId: string): Promise<Record<string, string>> {
++    const row = await this.dbGet<{ ai_routing: string | null }>(
++      "SELECT ai_routing FROM workspaces WHERE id = $workspaceId LIMIT 1",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+-    let routingStr: string | null = null;
+-    if (stmt.step()) {
+-      routingStr = stmt.getAsObject().ai_routing;
+-    }
+-    stmt.free();
++    const routingStr: string | null = row ? row.ai_routing : null;
+ 
+     const defaultRouting: Record<string, string> = {
+       product_analysis: "deepseek",
+@@ -4600,27 +4108,23 @@
+     }
+   }
+ 
+-  public saveAIRouting(workspaceId: string, routing: Record<string, string>): void {
+-    this.db.run(
++  public async saveAIRouting(workspaceId: string, routing: Record<string, string>): Promise<void> {
++    await this.dbRun(
+       "UPDATE workspaces SET ai_routing = $aiRouting WHERE id = $workspaceId",
+       {
+         $aiRouting: JSON.stringify(routing),
+         $workspaceId: workspaceId,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getAIUsageStats(workspaceId: string): any {
+-    const stmt = this.db.prepare(
+-      "SELECT ai_usage_stats FROM workspaces WHERE id = $workspaceId LIMIT 1"
++  public async getAIUsageStats(workspaceId: string): Promise<any> {
++    const row = await this.dbGet<{ ai_usage_stats: string | null }>(
++      "SELECT ai_usage_stats FROM workspaces WHERE id = $workspaceId LIMIT 1",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+-    let statsStr: string | null = null;
+-    if (stmt.step()) {
+-      statsStr = stmt.getAsObject().ai_usage_stats;
+-    }
+-    stmt.free();
++    const statsStr: string | null = row ? row.ai_usage_stats : null;
+ 
+     const defaultStats = {
+       tokens: { prompt: 154200, completion: 89450 },
+@@ -4643,76 +4147,69 @@
+     }
+   }
+ 
+-  public saveAIUsageStats(workspaceId: string, stats: any): void {
+-    this.db.run(
++  public async saveAIUsageStats(workspaceId: string, stats: any): Promise<void> {
++    await this.dbRun(
+       "UPDATE workspaces SET ai_usage_stats = $aiUsageStats WHERE id = $workspaceId",
+       {
+         $aiUsageStats: JSON.stringify(stats),
+         $workspaceId: workspaceId,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public deleteAIProvider(workspaceId: string, provider: AIProviderName): void {
+-    this.db.run(
++  public async deleteAIProvider(workspaceId: string, provider: AIProviderName): Promise<void> {
++    await this.dbRun(
+       "DELETE FROM workspace_ai_providers WHERE workspace_id = $workspaceId AND provider = $provider",
+       { $workspaceId: workspaceId, $provider: provider }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getAIProviderApiKey(workspaceId: string, provider: AIProviderName, mustBeEnabled: boolean = true): string | null {
++  public async getAIProviderApiKey(workspaceId: string, provider: AIProviderName | "dataforseo", mustBeEnabled: boolean = true): Promise<string | null> {
+     const query = mustBeEnabled
+       ? "SELECT api_key_encrypted, api_key_iv FROM workspace_ai_providers WHERE workspace_id = $workspaceId AND provider = $provider AND is_enabled = 1 LIMIT 1"
+       : "SELECT api_key_encrypted, api_key_iv FROM workspace_ai_providers WHERE workspace_id = $workspaceId AND provider = $provider LIMIT 1";
+-    const stmt = this.db.prepare(query);
+-    stmt.bind({ $workspaceId: workspaceId, $provider: provider });
+     let key: string | null = null;
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++    const row = await this.dbGet<any>(query, { $workspaceId: workspaceId, $provider: provider });
++    if (row) {
+       key = decrypt(row.api_key_encrypted, row.api_key_iv);
+     }
+-    stmt.free();
+     return key;
+   }
+ 
+-  public getWooCommerceConnection(workspaceId: string): WooCommerceConnection | null {
+-    const stmt = this.db.prepare(
+-      "SELECT store_url, is_active, last_sync_at FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId LIMIT 1"
+-    );
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getWooCommerceConnection(workspaceId: string): Promise<WooCommerceConnection | null> {
+     let connection: WooCommerceConnection | null = null;
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++    const row = await this.dbGet<any>(
++      "SELECT store_url, is_active, last_sync_at FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId LIMIT 1"
++    , { $workspaceId: workspaceId });
++    if (row) {
+       connection = {
+         storeUrl: row.store_url,
+         isActive: row.is_active === 1,
+         lastSyncAt: row.last_sync_at || undefined,
+       };
+     }
+-    stmt.free();
+     return connection;
+   }
+ 
+-  public saveWooCommerceConnection(
++  public async saveWooCommerceConnection(
+     workspaceId: string,
+     storeUrl: string,
+     consumerKey: string,
+     consumerSecret: string,
+     isActive: boolean
+-  ): void {
++  ): Promise<void> {
+     const now = new Date().toISOString();
+     const { encrypted: keyEnc, iv: keyIv } = encrypt(consumerKey);
+     const { encrypted: secretEnc, iv: secretIv } = encrypt(consumerSecret);
+-    const stmt = this.db.prepare(
+-      "SELECT id FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId LIMIT 1"
++    const existsRow = await this.dbGet(
++      "SELECT id FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId LIMIT 1",
++      { $workspaceId: workspaceId }
+     );
+-    stmt.bind({ $workspaceId: workspaceId });
+-    const exists = stmt.step();
+-    stmt.free();
++    const exists = !!existsRow;
+     if (exists) {
+-      this.db.run(
++      await this.dbRun(
+         `UPDATE workspace_woocommerce_connections
+          SET store_url = $storeUrl,
+              consumer_key_encrypted = $consumerKeyEncrypted,
+@@ -4734,7 +4231,7 @@
+         }
+       );
+     } else {
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO workspace_woocommerce_connections (
+           id, workspace_id, store_url, consumer_key_encrypted, consumer_key_iv,
+           consumer_secret_encrypted, consumer_secret_iv, is_active, created_at, updated_at
+@@ -4756,43 +4253,40 @@
+         }
+       );
+     }
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public deleteWooCommerceConnection(workspaceId: string): void {
+-    this.db.run(
++  public async deleteWooCommerceConnection(workspaceId: string): Promise<void> {
++    await this.dbRun(
+       "DELETE FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId",
+       { $workspaceId: workspaceId }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getWooCommerceCredentials(workspaceId: string): { storeUrl: string; consumerKey: string; consumerSecret: string } | null {
+-    const stmt = this.db.prepare(
+-      "SELECT store_url, consumer_key_encrypted, consumer_key_iv, consumer_secret_encrypted, consumer_secret_iv FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId AND is_active = 1 LIMIT 1"
+-    );
+-    stmt.bind({ $workspaceId: workspaceId });
++  public async getWooCommerceCredentials(workspaceId: string): Promise<{ storeUrl: string; consumerKey: string; consumerSecret: string } | null> {
+     let creds: any = null;
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++    const row = await this.dbGet<any>(
++      "SELECT store_url, consumer_key_encrypted, consumer_key_iv, consumer_secret_encrypted, consumer_secret_iv FROM workspace_woocommerce_connections WHERE workspace_id = $workspaceId AND is_active = 1 LIMIT 1"
++    , { $workspaceId: workspaceId });
++    if (row) {
+       creds = {
+         storeUrl: row.store_url,
+         consumerKey: decrypt(row.consumer_key_encrypted, row.consumer_key_iv),
+         consumerSecret: decrypt(row.consumer_secret_encrypted, row.consumer_secret_iv),
+       };
+     }
+-    stmt.free();
+     return creds;
+   }
+ 
+-  public saveOAuthState(
++  public async saveOAuthState(
+     workspaceId: string,
+     platform: string,
+     state: string,
+     redirectUri: string,
+     expiresAt: string
+-  ): void {
+-    this.db.run(
++  ): Promise<void> {
++    await this.dbRun(
+       `INSERT INTO oauth_states (id, workspace_id, platform, state, redirect_uri, created_at, expires_at)
+        VALUES ($id, $workspaceId, $platform, $state, $redirectUri, $createdAt, $expiresAt)`,
+       {
+@@ -4805,37 +4299,36 @@
+         $expiresAt: expiresAt,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getOAuthState(state: string): { workspaceId: string; platform: string; redirectUri: string } | null {
+-    const stmt = this.db.prepare(
+-      "SELECT workspace_id, platform, redirect_uri FROM oauth_states WHERE state = $state AND expires_at > $now LIMIT 1"
+-    );
+-    stmt.bind({ $state: state, $now: new Date().toISOString() });
++  public async getOAuthState(state: string): Promise<{ workspaceId: string; platform: string; redirectUri: string } | null> {
+     let result: any = null;
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++    const row = await this.dbGet<any>(
++      "SELECT workspace_id, platform, redirect_uri FROM oauth_states WHERE state = $state AND expires_at > $now LIMIT 1"
++    , { $state: state, $now: new Date().toISOString() });
++    if (row) {
+       result = {
+         workspaceId: row.workspace_id,
+         platform: row.platform,
+         redirectUri: row.redirect_uri,
+       };
+     }
+-    stmt.free();
+     return result;
+   }
+ 
+-  public deleteOAuthState(state: string): void {
+-    this.db.run("DELETE FROM oauth_states WHERE state = $state", { $state: state });
+-    this.saveToDisk();
+-  }
+-  public getDatabase() {
+-    return this.db;
+-  }
++  public async deleteOAuthState(state: string): Promise<void> {
++    await this.dbRun("DELETE FROM oauth_states WHERE state = $state", { $state: state });
++    await this.saveToDisk();
++  }
++  // PHASE 2 CUTOVER: getDatabase() removed. It previously exposed the raw
++  // sql.js Database handle so identity repositories could run their own
++  // queries directly. Those repositories now use the public dbGet/dbAll/dbRun
++  // helpers above instead (see server/identity/repositories/Postgres*Repository.ts),
++  // which keeps the pg Pool encapsulated inside DatabaseManager.
+ 
+   // --- IMAGE STUDIO PROJECTS METHODS ---
+-  public saveImageStudioProject(project: {
++  public async saveImageStudioProject(project: {
+     id: string;
+     workspaceId: string;
+     name: string;
+@@ -4843,9 +4336,9 @@
+     canvasWidth: number;
+     canvasHeight: number;
+     layers: string;
+-  }): void {
++  }): Promise<void> {
+     const now = new Date().toISOString();
+-    this.db.run(
++    await this.dbRun(
+       `INSERT INTO image_studio_projects (id, workspace_id, name, aspect_ratio, canvas_width, canvas_height, layers, created_at, updated_at)
+        VALUES ($id, $workspaceId, $name, $aspectRatio, $canvasWidth, $canvasHeight, $layers, $createdAt, $updatedAt)
+        ON CONFLICT(id) DO UPDATE SET
+@@ -4867,17 +4360,15 @@
+         $updatedAt: now,
+       }
+     );
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ 
+-  public getImageStudioProjects(workspaceId: string): any[] {
+-    const stmt = this.db.prepare(
++  public async getImageStudioProjects(workspaceId: string): Promise<any[]> {
++    const rows = await this.dbAll<any>(
+       "SELECT * FROM image_studio_projects WHERE workspace_id = $workspaceId ORDER BY updated_at DESC"
+-    );
+-    stmt.bind({ $workspaceId: workspaceId });
++    , { $workspaceId: workspaceId });
+     const list: any[] = [];
+-    while (stmt.step()) {
+-      const row = stmt.getAsObject();
++    for (const row of rows) {
+       list.push({
+         id: row.id,
+         workspaceId: row.workspace_id,
+@@ -4890,22 +4381,19 @@
+         updatedAt: row.updated_at,
+       });
+     }
+-    stmt.free();
+     return list;
+   }
+ 
+-  public deleteImageStudioProject(projectId: string): void {
+-    this.db.run("DELETE FROM image_studio_projects WHERE id = $id", { $id: projectId });
+-    this.saveToDisk();
++  public async deleteImageStudioProject(projectId: string): Promise<void> {
++    await this.dbRun("DELETE FROM image_studio_projects WHERE id = $id", { $id: projectId });
++    await this.saveToDisk();
+   }
+ 
+-  public duplicateImageStudioProject(projectId: string, newProjectId: string, newName: string): void {
+-    const stmt = this.db.prepare("SELECT * FROM image_studio_projects WHERE id = $id LIMIT 1");
+-    stmt.bind({ $id: projectId });
+-    if (stmt.step()) {
+-      const row = stmt.getAsObject();
++  public async duplicateImageStudioProject(projectId: string, newProjectId: string, newName: string): Promise<void> {
++    const row = await this.dbGet<any>("SELECT * FROM image_studio_projects WHERE id = $id LIMIT 1", { $id: projectId });
++    if (row) {
+       const now = new Date().toISOString();
+-      this.db.run(
++      await this.dbRun(
+         `INSERT INTO image_studio_projects (id, workspace_id, name, aspect_ratio, canvas_width, canvas_height, layers, created_at, updated_at)
+          VALUES ($newId, $workspaceId, $name, $aspectRatio, $canvasWidth, $canvasHeight, $layers, $createdAt, $updatedAt)`,
+         {
+@@ -4921,7 +4409,6 @@
+         }
+       );
+     }
+-    stmt.free();
+-    this.saveToDisk();
++    await this.saveToDisk();
+   }
+ }
+```

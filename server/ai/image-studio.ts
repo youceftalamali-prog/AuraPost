@@ -11,195 +11,256 @@ export interface ImageAnalysisReport {
   marketplaceCheck: string;
 }
 
-// Curated high-resolution professional product photography backdrops
-const BG_STYLING_MAP: Record<string, string[]> = {
-  marble: [
-    "https://images.unsplash.com/photo-1600585154340-be6161a56a0c?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1590486803833-1c5dc8ddd4c8?auto=format&fit=crop&w=1200&q=80"
-  ],
-  wood: [
-    "https://images.unsplash.com/photo-1533090161767-e6ffed986c88?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1449241717754-a348912d3f44?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1541123437800-1bb1317badc2?auto=format&fit=crop&w=1200&q=80"
-  ],
-  neon: [
-    "https://images.unsplash.com/photo-1507608869274-d3177c8bb4c7?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1519751138087-5bf79df62d5b?auto=format&fit=crop&w=1200&q=80"
-  ],
-  studio: [
-    "https://images.unsplash.com/photo-1516035069371-29a1b244cc32?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1542038784456-1ea8e935640e?auto=format&fit=crop&w=1200&q=80"
-  ],
-  luxury: [
-    "https://images.unsplash.com/photo-1547887537-6158d64c35b3?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1513519245088-0e12902e5a38?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1528255671579-01b9e182ed1d?auto=format&fit=crop&w=1200&q=80"
-  ],
-  cyberpunk: [
-    "https://images.unsplash.com/photo-1508739773434-c26b3d09e071?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1578894381163-e72c17f2d45f?auto=format&fit=crop&w=1200&q=80"
-  ],
-  cosmic: [
-    "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1462331940025-496dfbfc7564?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1506318137071-a8e063b4bec0?auto=format&fit=crop&w=1200&q=80"
-  ],
-  white: [
-    "https://images.unsplash.com/photo-1581091226825-a6a2a5aee158?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=1200&q=80",
-    "https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=1200&q=80"
-  ]
-};
-
-const DEFAULT_IMAGES = [
-  "https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=1000&q=80", // minimal watch
-  "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=1000&q=80", // headphones
-  "https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=1000&q=80", // red shoes
-  "https://images.unsplash.com/photo-1572635196237-14b3f281503f?auto=format&fit=crop&w=1000&q=80", // sunglasses
-  "https://images.unsplash.com/photo-1560343090-f0409e92791a?auto=format&fit=crop&w=1000&q=80", // brown boots
-  "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=1000&q=80", // retro camera
-  "https://images.unsplash.com/photo-1503602642458-232111445657?auto=format&fit=crop&w=1000&q=80", // wooden stool
-  "https://images.unsplash.com/photo-1511556532299-8f662fc26c06?auto=format&fit=crop&w=1000&q=80"  // elegant cosmetics
-];
-
 export class ImageStudioService {
 
   /**
    * Generates or synthesizes a product/brand ad image based on provider selection & prompts.
-   * Leverages real Gemini/OpenAI API calls or fallback premium photo-manipulation.
+   * Leverages real Gemini/OpenAI/BFL API calls.
    */
   public static async generateImage(params: {
     workspaceId: string;
     prompt: string;
-    provider: string; // "flux" | "gemini_images" | "openai_images" | "stability_ai"
+    provider: string; // "flux" | "google_imagen" | "openai_images" | "stability_ai" | "gemini_images"
     aspectRatio?: "1:1" | "3:4" | "4:3" | "9:16" | "16:9";
     category?: string; // e.g. "product_ad", "lifestyle", "luxury"
+    mode?: "text_to_image" | "product_to_image" | "image_to_image" | "backdrop_generation" | "marketing_banner";
+    productImageBase64?: string;
   }): Promise<{ imageUrl: string; modelUsed: string; latencyMs: number; status: string }> {
     const start = Date.now();
-    const { workspaceId, prompt, provider, aspectRatio = "1:1", category } = params;
+    const { workspaceId, prompt, provider, aspectRatio = "1:1", category, mode = "text_to_image", productImageBase64 } = params;
 
     const db = await DatabaseManager.getInstance();
     
-    // Attempt real API call if keys exist
-    try {
-      if (provider === "gemini_images" || provider === "flux") {
-        // Find Gemini API Key
-        const apiKey = await db.getAIProviderApiKey(workspaceId, "gemini_images") || process.env.GEMINI_API_KEY;
-        if (apiKey) {
-          console.log(`[ImageStudioService] Calling Gemini Image Generation...`);
-          const ai = new GoogleGenAI({ apiKey });
-          const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash-image",
-            contents: {
-              parts: [{ text: `${prompt}. Clean commercial studio photography, extremely detailed, professional lighting, photorealistic, 4k.` }]
-            },
-            config: {
-              imageConfig: {
-                aspectRatio
-              }
-            }
-          });
+    // Construct mode-enhanced prompt for professional production quality
+    let enhancedPrompt = prompt;
+    if (mode === "backdrop_generation") {
+      enhancedPrompt = `A premium professional commercial background studio scene: ${prompt}. Photorealistic, studio lighting, hyper-detailed, clean bokeh, 4k resolution, optimized for e-commerce product placement.`;
+    } else if (mode === "product_to_image") {
+      enhancedPrompt = `High-end advertising context placing a product inside a ${prompt}, realistic cast shadows, exquisite depth of field, award-winning composition, commercial photorealistic product shot.`;
+    } else if (mode === "marketing_banner") {
+      enhancedPrompt = `A stunning commercial banner background styled like a ${prompt}, modern minimalist layout space, beautiful lighting, rich color palette.`;
+    } else if (mode === "image_to_image") {
+      enhancedPrompt = `A stylized cinematic creative re-imagining of the scene into: ${prompt}. Artistic commercial grade rendering, extreme depth of field, 8k resolution.`;
+    } else {
+      enhancedPrompt = `${prompt}. Clean commercial studio photography, extremely detailed, professional lighting, photorealistic, 4k.`;
+    }
 
-          // Extract image from response parts
-          if (response?.candidates?.[0]?.content?.parts) {
-            for (const part of response.candidates[0].content.parts) {
-              if (part.inlineData) {
-                const base64 = part.inlineData.data;
-                const imageUrl = `data:${part.inlineData.mimeType || "image/png"};base64,${base64}`;
-                return {
-                  imageUrl,
-                  modelUsed: "gemini-2.5-flash-image",
-                  latencyMs: Date.now() - start,
-                  status: "success"
-                };
-              }
-            }
+    if (provider === "flux") {
+      // SECURITY/INTEGRITY FIX (Phase 2): the previous implementation silently substituted
+      // a mock API key ("bfl_mock_key_2026") and fabricated fake BFL task IDs / poll
+      // responses whenever no real FLUX_API_KEY was configured, ultimately returning a
+      // hardcoded Unsplash stock photo as if it were a real generated image. That entire
+      // simulation branch has been removed. Flux generation now requires a real API key
+      // and fails with a clear, honest error if one is not configured - consistent with
+      // how the OpenAI, Gemini, and Stability AI providers already behaved.
+      const apiKey = await db.getAIProviderApiKey(workspaceId, "flux") || process.env.FLUX_API_KEY;
+      if (!apiKey) {
+        throw new Error("Missing FLUX_API_KEY. Please configure your Black Forest Labs (Flux) API key in the AI Providers settings.");
+      }
+
+      console.log(`[ImageStudioService] Calling Black Forest Labs (BFL) Flux API...`);
+      const endpoint = "https://api.bfl.ai/v1/flux-dev";
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Key": apiKey
+        },
+        body: JSON.stringify({
+          prompt: enhancedPrompt,
+          width: 1024,
+          height: 1024
+        })
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Flux API Generation Error (HTTP ${response.status}): ${errText || response.statusText}`);
+      }
+
+      const taskData = (await response.json()) as { id?: string };
+      console.log("Full BFL response body:", JSON.stringify(taskData));
+      const taskId = taskData.id;
+      if (!taskId) {
+        throw new Error(`Flux API did not return a valid task ID. Response: ${JSON.stringify(taskData)}`);
+      }
+
+      // Poll for task completion
+      let imageUrl = "";
+      const timeoutMs = 45000; // 45 seconds timeout
+      const pollStart = Date.now();
+
+      while (Date.now() - pollStart < timeoutMs) {
+        const endpoint = `https://api.bfl.ai/v1/get_result?id=${taskId}`;
+
+        // SECURITY/INTEGRITY FIX (Phase 2): removed the mock polling branch that
+        // fabricated "Processing" then "Ready" responses and returned a hardcoded
+        // Unsplash stock photo URL. Polling now always calls the real BFL endpoint.
+        const response = await fetch(endpoint, {
+          headers: { "X-Key": apiKey }
+        });
+        console.log("Flux status:", response.status);
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Flux API status check failed: ${response.statusText} - ${errText}`);
+        }
+
+        const checkData = (await response.json()) as {
+          status: string;
+          result?: { sample?: string };
+        };
+
+        if (checkData.status === "Ready") {
+          imageUrl = checkData.result?.sample || "";
+          break;
+        } else if (checkData.status === "Failed") {
+          throw new Error(`Flux server-side image generation failed.`);
+        }
+
+        // Wait 1.5 seconds before next poll
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+
+      if (!imageUrl) {
+        throw new Error("Flux image generation timed out.");
+      }
+
+      console.log("Final imageUrl returned:", imageUrl);
+
+      return {
+        imageUrl,
+        modelUsed: "flux-dev",
+        latencyMs: Date.now() - start,
+        status: "success"
+      };
+    }
+
+    if (provider === "google_imagen" || provider === "gemini_images") {
+      const apiKey = await db.getAIProviderApiKey(workspaceId, "gemini_images") || process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error("Missing GEMINI_API_KEY. Please configure your Gemini API key in the AI Providers settings.");
+      }
+
+      console.log(`[ImageStudioService] Calling Google GenAI (gemini-3.1-flash-image)...`);
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3.1-flash-image",
+        contents: {
+          parts: [{ text: enhancedPrompt }]
+        },
+        config: {
+          imageConfig: {
+            aspectRatio: aspectRatio === "1:1" ? "1:1" : aspectRatio === "3:4" ? "3:4" : aspectRatio === "4:3" ? "4:3" : aspectRatio === "16:9" ? "16:9" : "1:1",
+            imageSize: "1K"
+          }
+        }
+      });
+
+      let base64 = "";
+      if (response?.candidates?.[0]?.content?.parts) {
+        for (const part of response.candidates[0].content.parts) {
+          if (part.inlineData?.data) {
+            base64 = part.inlineData.data;
+            break;
           }
         }
       }
 
-      if (provider === "openai_images") {
-        const apiKey = await db.getAIProviderApiKey(workspaceId, "openai_images") || process.env.OPENAI_API_KEY;
-        if (apiKey) {
-          console.log(`[ImageStudioService] Calling OpenAI DALL-E 3 Image Generation...`);
-          const openai = new OpenAI({ apiKey });
-          const response = await openai.images.generate({
-            model: "dall-e-3",
-            prompt: `${prompt}. Luxury commercial product shot, 4k, clean composition.`,
-            n: 1,
-            size: "1024x1024",
-            response_format: "url"
-          });
-
-          if (response.data?.[0]?.url) {
-            return {
-              imageUrl: response.data[0].url,
-              modelUsed: "dall-e-3",
-              latencyMs: Date.now() - start,
-              status: "success"
-            };
-          }
-        }
+      if (base64) {
+        const imageUrl = `data:image/jpeg;base64,${base64}`;
+        return {
+          imageUrl,
+          modelUsed: "gemini-3.1-flash-image",
+          latencyMs: Date.now() - start,
+          status: "success"
+        };
+      } else {
+        throw new Error(`Google Image Generation API did not return image bytes. Response: ${JSON.stringify(response)}`);
       }
-    } catch (err: any) {
-      console.warn(`[ImageStudioService] AI Generation failed, invoking advanced fallback:`, err.message || err);
     }
 
-    // High quality themed fallback synthesis (Unsplash + Custom Prompt matching)
-    console.log(`[ImageStudioService] Executing high-quality themed synthesis fallback...`);
-    
-    // Choose backdrop style based on prompts or category
-    let styleKey = "studio";
-    const promptLower = prompt.toLowerCase();
-    
-    if (promptLower.includes("marble") || promptLower.includes("luxury") || promptLower.includes("gold") || promptLower.includes("perfume")) {
-      styleKey = "luxury";
-    } else if (promptLower.includes("wood") || promptLower.includes("table") || promptLower.includes("desk") || promptLower.includes("nature")) {
-      styleKey = "wood";
-    } else if (promptLower.includes("neon") || promptLower.includes("cyberpunk") || promptLower.includes("night") || promptLower.includes("glowing")) {
-      styleKey = "cyberpunk";
-    } else if (promptLower.includes("space") || promptLower.includes("galaxy") || promptLower.includes("stars")) {
-      styleKey = "cosmic";
-    } else if (promptLower.includes("white background") || promptLower.includes("clean white") || promptLower.includes("white room")) {
-      styleKey = "white";
+    if (provider === "openai_images") {
+      const apiKey = await db.getAIProviderApiKey(workspaceId, "openai_images") || process.env.OPENAI_API_KEY;
+      if (!apiKey) {
+        throw new Error("Missing OPENAI_API_KEY. Please configure your OpenAI API key in the AI Providers settings.");
+      }
+
+      console.log(`[ImageStudioService] Calling OpenAI DALL-E 3 Image Generation...`);
+      const openai = new OpenAI({ apiKey });
+      const response = await openai.images.generate({
+        model: "dall-e-3",
+        prompt: enhancedPrompt,
+        n: 1,
+        size: "1024x1024",
+        response_format: "url"
+      });
+
+      if (response.data?.[0]?.url) {
+        return {
+          imageUrl: response.data[0].url,
+          modelUsed: "openai-dall-e-3",
+          latencyMs: Date.now() - start,
+          status: "success"
+        };
+      } else {
+        throw new Error(`OpenAI DALL-E 3 API did not return an image URL. Response: ${JSON.stringify(response)}`);
+      }
     }
 
-    const backgrounds = BG_STYLING_MAP[styleKey] || BG_STYLING_MAP.studio;
-    const backgroundUrl = backgrounds[Math.floor(Math.random() * backgrounds.length)];
+    if (provider === "stability_ai") {
+      const apiKey = await db.getAIProviderApiKey(workspaceId, "stability_ai") || process.env.STABILITY_API_KEY;
+      if (!apiKey) {
+        throw new Error("Missing STABILITY_API_KEY. Please configure your Stability AI API key in the AI Providers settings.");
+      }
 
-    // Find a matching product overlay from Unsplash if possible, or use a beautiful default
-    let productUrl = DEFAULT_IMAGES[Math.floor(Math.random() * DEFAULT_IMAGES.length)];
-    if (promptLower.includes("watch") || promptLower.includes("time")) {
-      productUrl = "https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=1000&q=80";
-    } else if (promptLower.includes("headphone") || promptLower.includes("sound") || promptLower.includes("music")) {
-      productUrl = "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=1000&q=80";
-    } else if (promptLower.includes("shoe") || promptLower.includes("sneaker") || promptLower.includes("run")) {
-      productUrl = "https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=1000&q=80";
-    } else if (promptLower.includes("glass") || promptLower.includes("sun") || promptLower.includes("shade")) {
-      productUrl = "https://images.unsplash.com/photo-1572635196237-14b3f281503f?auto=format&fit=crop&w=1000&q=80";
-    } else if (promptLower.includes("cosmetic") || promptLower.includes("cream") || promptLower.includes("bottle") || promptLower.includes("serum")) {
-      productUrl = "https://images.unsplash.com/photo-1511556532299-8f662fc26c06?auto=format&fit=crop&w=1000&q=80";
-    } else if (promptLower.includes("camera") || promptLower.includes("photo") || promptLower.includes("lens")) {
-      productUrl = "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=1000&q=80";
+      console.log(`[ImageStudioService] Calling Stability AI SDXL Image Generation...`);
+      const stabilityResponse = await fetch("https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          text_prompts: [
+            {
+              text: enhancedPrompt,
+              weight: 1
+            }
+          ],
+          cfg_scale: 7,
+          height: 1024,
+          width: 1024,
+          samples: 1,
+          steps: 30
+        })
+      });
+
+      if (!stabilityResponse.ok) {
+        const errText = await stabilityResponse.text();
+        throw new Error(`Stability AI API error (HTTP ${stabilityResponse.status}): ${errText}`);
+      }
+
+      const resJson = (await stabilityResponse.json()) as {
+        artifacts?: Array<{ base64: string }>;
+      };
+
+      if (resJson.artifacts?.[0]?.base64) {
+        const base64 = resJson.artifacts[0].base64;
+        return {
+          imageUrl: `data:image/png;base64,${base64}`,
+          modelUsed: "stable-diffusion-xl-1024-v1-0",
+          latencyMs: Date.now() - start,
+          status: "success"
+        };
+      } else {
+        throw new Error(`Stability AI API did not return image artifacts. Response: ${JSON.stringify(resJson)}`);
+      }
     }
 
-    // Blend product and background URLs using a composite URL if needed or return a beautifully blended image representation
-    // We can return the beautiful product photo directly or compose them
-    // To provide a gorgeous, realistic "Studio Pro" feel, we'll return a stunning Unsplash image matching the theme
-    const finalUrl = styleKey === "white" 
-      ? productUrl 
-      : `https://images.unsplash.com/photo-${productUrl.split("photo-")[1]?.split("?")[0] || "1523275335684-37898b6baf30"}?auto=format&fit=crop&w=1000&q=80&blend=${encodeURIComponent(backgroundUrl)}&blend-mode=overlay&blend-alpha=30`;
-
-    return {
-      imageUrl: finalUrl,
-      modelUsed: `synthetic-${provider}-v1.5`,
-      latencyMs: Date.now() - start,
-      status: "success (fallback)"
-    };
+    throw new Error(`Unsupported image provider requested: ${provider}`);
   }
 
   /**
@@ -225,9 +286,17 @@ export class ImageStudioService {
       }
     }
 
+    // INTEGRITY FIX (Phase 2): image analysis previously fell back to a fabricated report
+    // with a `Math.random()`-generated quality score and canned text whenever Gemini Vision
+    // failed or was not configured, indistinguishable in the UI from a real audit. It now
+    // requires a real Gemini API key and surfaces real failures instead of inventing data.
+    const apiKey = await db.getAIProviderApiKey(workspaceId, "gemini") || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("Missing GEMINI_API_KEY. Please configure your Gemini API key in the AI Providers settings to run image analysis.");
+    }
+
     try {
-      const apiKey = await db.getAIProviderApiKey(workspaceId, "gemini") || process.env.GEMINI_API_KEY;
-      if (apiKey) {
+      {
         console.log(`[ImageStudioService] Running real Gemini Vision Audit on image...`);
         const ai = new GoogleGenAI({ apiKey });
 
@@ -267,34 +336,14 @@ You MUST respond with a valid JSON object matching this exact TypeScript structu
         const textResult = response.text || "";
         console.log(`[ImageStudioService] Gemini Vision Audit Raw Output:`, textResult);
         const parsed = JSON.parse(textResult.trim()) as ImageAnalysisReport;
-        
+
         return parsed;
       }
     } catch (err: any) {
-      console.warn(`[ImageStudioService] Gemini Vision failed or bypassed, activating smart fallback:`, err.message || err);
+      // INTEGRITY FIX (Phase 2): previously this swallowed the error and returned a
+      // fabricated report. Real failures must now be visible to the caller.
+      console.error(`[ImageStudioService] Gemini Vision image analysis failed:`, err.message || err);
+      throw new Error(`Image analysis failed: ${err.message || "Gemini Vision request did not succeed."}`);
     }
-
-    // High quality customized fallback report based on product title
-    const score = Math.floor(Math.random() * 15) + 78; // 78 - 92
-    const readyState: "Excellent" | "Good" | "Needs Improvement" = score > 85 ? "Excellent" : "Good";
-
-    return {
-      qualityScore: score,
-      marketplaceReadiness: readyState,
-      brandingReview: `The visual identity for ${productTitle || "your product"} is highly modern, featuring standard lighting, centered composition, and soft tones. Colors are balanced, making the product look premium and premium-tier. Ideal for high-end dropshipping or luxury e-commerce.`,
-      conversionOptimization: [
-        "Include a zoom-in callout showcasing the fine material textures and quality finishes.",
-        "Add a subtle lifestyle contextual element to help customers visualize real-world scale instantly.",
-        "Insert a clean 'Free Shipping' or warranty badge to increase checkout click-through rates.",
-        "A/B test a warmer color temperature background to see if engagement rises on social feeds."
-      ],
-      seoSuggestions: [
-        `Rename the image file to '${(productTitle || "product").toLowerCase().replace(/[^a-z0-9]+/g, "-")}-luxury-edition.webp' instead of default names.`,
-        "Utilize high-relevance visual Alt Tags like 'Premium hand-crafted luxury design accessory on marble backdrop'.",
-        "Compress the file to WebP format to reduce page load speed below 1.2 seconds for higher Google ranking.",
-        "Integrate schema.json structured markup referencing this high-resolution visual file."
-      ],
-      marketplaceCheck: "Meets 95% of standard marketplace specifications. Background contrast is ideal for Shopify. For Amazon listing requirements, ensure a pure white (#FFFFFF) background and that the product occupies at least 85% of the canvas frame."
-    };
   }
 }

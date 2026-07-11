@@ -1,0 +1,13 @@
+This directory is intentionally near-empty in the shipped source package.
+
+The application no longer uses local file storage for its database (see
+POSTGRESQL_CUTOVER_REPORT.md) — all data lives in PostgreSQL via DATABASE_URL.
+The PostgreSQL schema itself lives at server/db/postgres/schema.sql, and the
+one-time SQLite-to-PostgreSQL migration utility (for legacy installations
+only) lives at scripts/migrate-sqlite-to-postgres.ts.
+
+Historical debug artifacts that previously lived in this folder (a stale
+SQLite database file, and two Meta OAuth debug/audit JSON files from earlier
+manual testing) have been removed before packaging, since they were runtime
+artifacts specific to a prior developer's testing session, not required
+migration or sample files for this codebase.

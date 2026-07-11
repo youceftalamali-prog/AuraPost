@@ -1,3 +1,8 @@
+# Deleted File: server/shopify-extractor.ts
+
+This file existed in the original upload and was removed. Original content preserved for the audit trail:
+
+```
 import { GoogleGenAI, Type } from "@google/genai";
 
 export interface ExtractedProduct {
@@ -390,3 +395,4 @@ async function scrapeWithAIFallback(url: string, aiClient: GoogleGenAI | null): 
     availability: true
   };
 }
+```

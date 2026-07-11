@@ -1,17 +1,27 @@
+# New File: server/identity/repositories/PostgresUserRepository.ts
+
+This file did not exist in the original upload. Full contents:
+
+```ts
 import type { User } from "../models/User";
 import { AuthProvider, UserStatus } from "../models/User";
 import { UserRepository } from "./UserRepository";
 import { DatabaseManager } from "../../db";
 
-export class SqliteUserRepository implements UserRepository {
-  private async getDb() {
-    const manager = await DatabaseManager.getInstance();
-    return manager.getDatabase();
-  }
-
-  private async save() {
-    const manager = await DatabaseManager.getInstance();
-    manager.saveToDisk();
+/**
+ * PHASE 2 — POSTGRESQL CUTOVER
+ * Replaces the former SqliteUserRepository, which reached into
+ * DatabaseManager's raw sql.js handle via getDatabase() and ran its own
+ * prepare/bind/step/free calls directly. That escape hatch is gone — this
+ * repository now goes through DatabaseManager's public dbGet/dbAll/dbRun
+ * helpers, which are backed by a real, pooled PostgreSQL connection.
+ * The UserRepository interface (findById/findByEmail/create/update/delete/
+ * exists/list) is unchanged, so AuthService and everything else that depends
+ * on it needed no changes.
+ */
+export class PostgresUserRepository implements UserRepository {
+  private async db() {
+    return DatabaseManager.getInstance();
   }
 
   private mapRowToUser(row: any): User {
@@ -34,36 +44,26 @@ export class SqliteUserRepository implements UserRepository {
   }
 
   async findById(id: string): Promise<User | null> {
-    const db = await this.getDb();
-    const stmt = db.prepare("SELECT * FROM users WHERE id = $id LIMIT 1");
-    stmt.bind({ $id: id });
-    const hasRow = stmt.step();
-    if (!hasRow) {
-      stmt.free();
-      return null;
-    }
-    const row = stmt.getAsObject();
-    stmt.free();
-    return this.mapRowToUser(row);
+    const db = await this.db();
+    const row = await db.dbGet("SELECT * FROM users WHERE id = $id LIMIT 1", { $id: id });
+    return row ? this.mapRowToUser(row) : null;
   }
 
+  /**
+   * PHASE 2 NOTE: case-insensitive email matching (previously SQLite's
+   * COLLATE NOCASE on the column) is done here with LOWER() on both sides,
+   * matching the functional unique index defined in schema.sql
+   * (idx_users_email_lower). See POSTGRESQL_CUTOVER_REPORT.md.
+   */
   async findByEmail(email: string): Promise<User | null> {
-    const db = await this.getDb();
-    const stmt = db.prepare("SELECT * FROM users WHERE email = $email LIMIT 1");
-    stmt.bind({ $email: email });
-    const hasRow = stmt.step();
-    if (!hasRow) {
-      stmt.free();
-      return null;
-    }
-    const row = stmt.getAsObject();
-    stmt.free();
-    return this.mapRowToUser(row);
+    const db = await this.db();
+    const row = await db.dbGet("SELECT * FROM users WHERE LOWER(email) = LOWER($email) LIMIT 1", { $email: email });
+    return row ? this.mapRowToUser(row) : null;
   }
 
   async create(user: User): Promise<User> {
-    const db = await this.getDb();
-    db.run(
+    const db = await this.db();
+    await db.dbRun(
       `INSERT INTO users (
         id, email, password_hash, first_name, last_name, avatar,
         auth_provider, provider_id, role, status, email_verified,
@@ -90,7 +90,6 @@ export class SqliteUserRepository implements UserRepository {
         $updated_at: user.updatedAt.toISOString(),
       }
     );
-    await this.save();
     return user;
   }
 
@@ -106,8 +105,8 @@ export class SqliteUserRepository implements UserRepository {
       updatedAt: new Date()
     };
 
-    const db = await this.getDb();
-    db.run(
+    const db = await this.db();
+    await db.dbRun(
       `UPDATE users SET
         email = $email,
         password_hash = $password_hash,
@@ -138,14 +137,12 @@ export class SqliteUserRepository implements UserRepository {
         $updated_at: updated.updatedAt.toISOString(),
       }
     );
-    await this.save();
     return updated;
   }
 
   async delete(id: string): Promise<void> {
-    const db = await this.getDb();
-    db.run("DELETE FROM users WHERE id = $id", { $id: id });
-    await this.save();
+    const db = await this.db();
+    await db.dbRun("DELETE FROM users WHERE id = $id", { $id: id });
   }
 
   async exists(email: string): Promise<boolean> {
@@ -154,14 +151,9 @@ export class SqliteUserRepository implements UserRepository {
   }
 
   async list(): Promise<User[]> {
-    const db = await this.getDb();
-    const stmt = db.prepare("SELECT * FROM users ORDER BY created_at DESC");
-    const users: User[] = [];
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
-      users.push(this.mapRowToUser(row));
-    }
-    stmt.free();
-    return users;
+    const db = await this.db();
+    const rows = await db.dbAll("SELECT * FROM users ORDER BY created_at DESC");
+    return rows.map((row) => this.mapRowToUser(row));
   }
 }
+```

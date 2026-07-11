@@ -1,3 +1,8 @@
+# Deleted File: inspect_social.ts
+
+This file existed in the original upload and was removed. Original content preserved for the audit trail:
+
+```
 import fs from "fs";
 import initSqlJs from "sql.js";
 
@@ -40,3 +45,4 @@ async function main() {
 main().catch(console.error);
 
 main().catch(console.error);
+```

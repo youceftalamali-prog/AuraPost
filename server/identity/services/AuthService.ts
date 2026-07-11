@@ -3,26 +3,27 @@ import type { User } from "../models/User";
 import { AuthProvider, UserStatus } from "../models/User";
 import type { Session } from "../models/Session";
 import type { RefreshToken } from "../models/RefreshToken";
-import { SqliteUserRepository } from "../repositories/SqliteUserRepository";
-import { SqliteSessionRepository } from "../repositories/SqliteSessionRepository";
-import { SqliteRefreshTokenRepository } from "../repositories/SqliteRefreshTokenRepository";
+import { PostgresUserRepository } from "../repositories/PostgresUserRepository";
+import { PostgresSessionRepository } from "../repositories/PostgresSessionRepository";
+import { PostgresRefreshTokenRepository } from "../repositories/PostgresRefreshTokenRepository";
 import { PasswordService } from "./PasswordService";
 import { JwtService } from "./JwtService";
 import { AppError } from "../../core/errors/AppError";
 import type { RegisterDto } from "../dto/Register.dto";
 import type { LoginDto } from "../dto/Login.dto";
+import { DatabaseManager } from "../../db";
 
 export class AuthService {
-  private userRepository: SqliteUserRepository;
-  private sessionRepository: SqliteSessionRepository;
-  private refreshTokenRepository: SqliteRefreshTokenRepository;
+  private userRepository: PostgresUserRepository;
+  private sessionRepository: PostgresSessionRepository;
+  private refreshTokenRepository: PostgresRefreshTokenRepository;
   private passwordService: PasswordService;
   private jwtService: JwtService;
 
   constructor() {
-    this.userRepository = new SqliteUserRepository();
-    this.sessionRepository = new SqliteSessionRepository();
-    this.refreshTokenRepository = new SqliteRefreshTokenRepository();
+    this.userRepository = new PostgresUserRepository();
+    this.sessionRepository = new PostgresSessionRepository();
+    this.refreshTokenRepository = new PostgresRefreshTokenRepository();
     this.passwordService = new PasswordService();
     this.jwtService = new JwtService();
   }
@@ -55,6 +56,12 @@ export class AuthService {
     };
 
     const createdUser = await this.userRepository.create(newUser);
+
+    // SECURITY FIX (Phase 1): every user must have an explicit, auditable workspace
+    // membership row. Without this, workspace-level authorization cannot be enforced.
+    const db = await DatabaseManager.getInstance();
+    await db.ensureUserHasWorkspace(createdUser.id);
+
     return { user: createdUser };
   }
 
@@ -79,6 +86,11 @@ export class AuthService {
 
     // Update user's last login
     await this.userRepository.update(user.id, { lastLoginAt: new Date() });
+
+    // SECURITY FIX (Phase 1): migrate pre-existing users (created before this fix)
+    // to have an explicit workspace membership row.
+    const db = await DatabaseManager.getInstance();
+    await db.ensureUserHasWorkspace(user.id);
 
     // Generate tokens
     const payload = {

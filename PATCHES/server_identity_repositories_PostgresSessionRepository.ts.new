@@ -2,15 +2,14 @@ import type { Session } from "../models/Session";
 import { SessionRepository } from "./SessionRepository";
 import { DatabaseManager } from "../../db";
 
-export class SqliteSessionRepository implements SessionRepository {
-  private async getDb() {
-    const manager = await DatabaseManager.getInstance();
-    return manager.getDatabase();
-  }
-
-  private async save() {
-    const manager = await DatabaseManager.getInstance();
-    manager.saveToDisk();
+/**
+ * PHASE 2 — POSTGRESQL CUTOVER
+ * Replaces the former SqliteSessionRepository (see PostgresUserRepository.ts
+ * for the full rationale — identical pattern applied here).
+ */
+export class PostgresSessionRepository implements SessionRepository {
+  private async db() {
+    return DatabaseManager.getInstance();
   }
 
   private mapRowToSession(row: any): Session {
@@ -31,35 +30,23 @@ export class SqliteSessionRepository implements SessionRepository {
   }
 
   async findById(id: string): Promise<Session | null> {
-    const db = await this.getDb();
-    const stmt = db.prepare("SELECT * FROM sessions WHERE id = $id LIMIT 1");
-    stmt.bind({ $id: id });
-    const hasRow = stmt.step();
-    if (!hasRow) {
-      stmt.free();
-      return null;
-    }
-    const row = stmt.getAsObject();
-    stmt.free();
-    return this.mapRowToSession(row);
+    const db = await this.db();
+    const row = await db.dbGet("SELECT * FROM sessions WHERE id = $id LIMIT 1", { $id: id });
+    return row ? this.mapRowToSession(row) : null;
   }
 
   async findByUser(userId: string): Promise<Session[]> {
-    const db = await this.getDb();
-    const stmt = db.prepare("SELECT * FROM sessions WHERE user_id = $user_id ORDER BY created_at DESC");
-    stmt.bind({ $user_id: userId });
-    const sessions: Session[] = [];
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
-      sessions.push(this.mapRowToSession(row));
-    }
-    stmt.free();
-    return sessions;
+    const db = await this.db();
+    const rows = await db.dbAll(
+      "SELECT * FROM sessions WHERE user_id = $user_id ORDER BY created_at DESC",
+      { $user_id: userId }
+    );
+    return rows.map((row) => this.mapRowToSession(row));
   }
 
   async create(session: Session): Promise<Session> {
-    const db = await this.getDb();
-    db.run(
+    const db = await this.db();
+    await db.dbRun(
       `INSERT INTO sessions (
         id, user_id, refresh_token_id, ip_address, user_agent,
         device, platform, browser, is_active, last_activity_at,
@@ -84,7 +71,6 @@ export class SqliteSessionRepository implements SessionRepository {
         $updated_at: session.updatedAt.toISOString(),
       }
     );
-    await this.save();
     return session;
   }
 
@@ -100,8 +86,8 @@ export class SqliteSessionRepository implements SessionRepository {
       updatedAt: new Date()
     };
 
-    const db = await this.getDb();
-    db.run(
+    const db = await this.db();
+    await db.dbRun(
       `UPDATE sessions SET
         user_id = $user_id,
         refresh_token_id = $refresh_token_id,
@@ -128,22 +114,19 @@ export class SqliteSessionRepository implements SessionRepository {
         $updated_at: updated.updatedAt.toISOString(),
       }
     );
-    await this.save();
     return updated;
   }
 
   async deactivate(id: string): Promise<void> {
-    const db = await this.getDb();
-    db.run("UPDATE sessions SET is_active = 0, updated_at = $updated_at WHERE id = $id", {
+    const db = await this.db();
+    await db.dbRun("UPDATE sessions SET is_active = 0, updated_at = $updated_at WHERE id = $id", {
       $id: id,
       $updated_at: new Date().toISOString()
     });
-    await this.save();
   }
 
   async delete(id: string): Promise<void> {
-    const db = await this.getDb();
-    db.run("DELETE FROM sessions WHERE id = $id", { $id: id });
-    await this.save();
+    const db = await this.db();
+    await db.dbRun("DELETE FROM sessions WHERE id = $id", { $id: id });
   }
 }

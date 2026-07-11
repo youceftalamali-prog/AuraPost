@@ -1,0 +1,231 @@
+--- original_reference/server/ai/image-studio.ts	2026-07-06 18:23:36.000000000 +0000
++++ audit/server/ai/image-studio.ts	2026-07-06 21:12:57.406622039 +0000
+@@ -1,7 +1,6 @@
+ import { GoogleGenAI } from "@google/genai";
+ import { OpenAI } from "openai";
+ import { DatabaseManager } from "../db.ts";
+-import fs from "fs";
+ 
+ export interface ImageAnalysisReport {
+   qualityScore: number;
+@@ -47,94 +46,33 @@
+     }
+ 
+     if (provider === "flux") {
+-      // --- RUNTIME DATABASE AUDIT LOG ---
+-      const sqliteDb = (db as any).getDatabase();
+-      const sqliteRows: any[] = [];
+-      if (sqliteDb) {
+-        try {
+-          const stmt = sqliteDb.prepare("SELECT workspace_id, provider, is_enabled FROM workspace_ai_providers");
+-          while (stmt.step()) {
+-            sqliteRows.push(stmt.getAsObject());
+-          }
+-          stmt.free();
+-        } catch (e: any) {
+-          console.error("[AUDIT ERROR] Failed to query sqlite directly:", e.message);
+-        }
+-      }
+-
+-      const dbFilePath = process.env.NODE_ENV === "production" ? "/tmp/aurapost.db" : "./storage/aurapost.db";
+-      const keyReturned = await db.getAIProviderApiKey(workspaceId, "flux");
+-      const nodeEnvValue = process.env.NODE_ENV;
+-      const containsFluxRow = sqliteRows.some((r: any) => r.provider === "flux");
+-
+-      const logLines: string[] = [];
+-      logLines.push("=== PROCESS-INTERNAL GENERATION AUDIT ===");
+-      logLines.push(`1. workspaceId: ${workspaceId}`);
+-      logLines.push(`2. Rows returned by SQLite (workspace_ai_providers): ${JSON.stringify(sqliteRows, null, 2)}`);
+-      logLines.push(`3. Database file path in use: ${dbFilePath}`);
+-      logLines.push(`4. Value returned by getAIProviderApiKey(): ${keyReturned ? `[EXISTS, len=${keyReturned.length}]` : "null"}`);
+-      logLines.push(`5. Is running in production or development: ${nodeEnvValue === "production" ? "production" : "development"}`);
+-      logLines.push(`6. Whether NODE_ENV is set: ${nodeEnvValue !== undefined ? `yes (${nodeEnvValue})` : "no"}`);
+-      logLines.push(`7. Whether the database contains a flux row at that exact moment: ${containsFluxRow}`);
+-      logLines.push("=========================================\n");
+-
+-      const logText = logLines.join("\n");
+-      console.log(logText);
+-      try {
+-        fs.appendFileSync("./storage/audit.log", logText);
+-      } catch (err) {
+-        // ignore
+-      }
+-
+-      let apiKey = keyReturned || process.env.FLUX_API_KEY;
+-      const isSimulated = !apiKey;
+-      if (isSimulated) {
+-        apiKey = "bfl_mock_key_2026";
++      // SECURITY/INTEGRITY FIX (Phase 2): the previous implementation silently substituted
++      // a mock API key ("bfl_mock_key_2026") and fabricated fake BFL task IDs / poll
++      // responses whenever no real FLUX_API_KEY was configured, ultimately returning a
++      // hardcoded Unsplash stock photo as if it were a real generated image. That entire
++      // simulation branch has been removed. Flux generation now requires a real API key
++      // and fails with a clear, honest error if one is not configured - consistent with
++      // how the OpenAI, Gemini, and Stability AI providers already behaved.
++      const apiKey = await db.getAIProviderApiKey(workspaceId, "flux") || process.env.FLUX_API_KEY;
++      if (!apiKey) {
++        throw new Error("Missing FLUX_API_KEY. Please configure your Black Forest Labs (Flux) API key in the AI Providers settings.");
+       }
+ 
+       console.log(`[ImageStudioService] Calling Black Forest Labs (BFL) Flux API...`);
+       const endpoint = "https://api.bfl.ai/v1/flux-dev";
+-      
+-      console.log("=== RUNTIME AUDIT LOG ===");
+-      console.log("workspaceId:", workspaceId);
+-      console.log("provider:", provider);
+-      console.log("apiKeyExists:", !isSimulated);
+-      console.log("isSimulated:", isSimulated);
+-      console.log("BFL endpoint used:", endpoint);
+-      console.log("=========================");
+-
+-      let response: Response;
+-      if (isSimulated) {
+-        console.log("BFL_REQUEST_POST:", JSON.stringify({
++
++      const response = await fetch(endpoint, {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/json",
++          "X-Key": apiKey
++        },
++        body: JSON.stringify({
+           prompt: enhancedPrompt,
+           width: 1024,
+           height: 1024
+-        }));
+-        const mockBflPostRes = { id: "bfl-task-884c9ad3-bf2d-4567-9382-fa4c49d2abcd" };
+-        console.log("BFL_RESPONSE_POST: HTTP 200 OK", JSON.stringify(mockBflPostRes));
+-        response = {
+-          ok: true,
+-          status: 200,
+-          statusText: "OK",
+-          json: async () => mockBflPostRes,
+-          text: async () => JSON.stringify(mockBflPostRes)
+-        } as Response;
+-      } else {
+-        response = await fetch(endpoint, {
+-          method: "POST",
+-          headers: {
+-            "Content-Type": "application/json",
+-            "X-Key": apiKey
+-          },
+-          body: JSON.stringify({
+-            prompt: enhancedPrompt,
+-            width: 1024,
+-            height: 1024
+-          })
+-        });
+-      }
+-      console.log("Flux status:", response.status);
+-      console.log("HTTP status from BFL:", response.status);
++        })
++      });
+ 
+       if (!response.ok) {
+         const errText = await response.text();
+@@ -152,39 +90,16 @@
+       let imageUrl = "";
+       const timeoutMs = 45000; // 45 seconds timeout
+       const pollStart = Date.now();
+-      let pollCount = 0;
+ 
+       while (Date.now() - pollStart < timeoutMs) {
+         const endpoint = `https://api.bfl.ai/v1/get_result?id=${taskId}`;
+-        console.log("Flux endpoint:", endpoint);
+ 
+-        let response: Response;
+-        if (isSimulated) {
+-          pollCount++;
+-          let mockPollRes;
+-          if (pollCount === 1) {
+-            mockPollRes = { status: "Processing" };
+-          } else {
+-            mockPollRes = {
+-              status: "Ready",
+-              result: {
+-                sample: "https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=1024&q=80"
+-              }
+-            };
+-          }
+-          console.log(`BFL_RESPONSE_GET (Call ${pollCount}): HTTP 200 OK`, JSON.stringify(mockPollRes));
+-          response = {
+-            ok: true,
+-            status: 200,
+-            statusText: "OK",
+-            json: async () => mockPollRes,
+-            text: async () => JSON.stringify(mockPollRes)
+-          } as Response;
+-        } else {
+-          response = await fetch(endpoint, {
+-            headers: { "X-Key": apiKey }
+-          });
+-        }
++        // SECURITY/INTEGRITY FIX (Phase 2): removed the mock polling branch that
++        // fabricated "Processing" then "Ready" responses and returned a hardcoded
++        // Unsplash stock photo URL. Polling now always calls the real BFL endpoint.
++        const response = await fetch(endpoint, {
++          headers: { "X-Key": apiKey }
++        });
+         console.log("Flux status:", response.status);
+ 
+         if (!response.ok) {
+@@ -371,9 +286,17 @@
+       }
+     }
+ 
++    // INTEGRITY FIX (Phase 2): image analysis previously fell back to a fabricated report
++    // with a `Math.random()`-generated quality score and canned text whenever Gemini Vision
++    // failed or was not configured, indistinguishable in the UI from a real audit. It now
++    // requires a real Gemini API key and surfaces real failures instead of inventing data.
++    const apiKey = await db.getAIProviderApiKey(workspaceId, "gemini") || process.env.GEMINI_API_KEY;
++    if (!apiKey) {
++      throw new Error("Missing GEMINI_API_KEY. Please configure your Gemini API key in the AI Providers settings to run image analysis.");
++    }
++
+     try {
+-      const apiKey = await db.getAIProviderApiKey(workspaceId, "gemini") || process.env.GEMINI_API_KEY;
+-      if (apiKey) {
++      {
+         console.log(`[ImageStudioService] Running real Gemini Vision Audit on image...`);
+         const ai = new GoogleGenAI({ apiKey });
+ 
+@@ -413,34 +336,14 @@
+         const textResult = response.text || "";
+         console.log(`[ImageStudioService] Gemini Vision Audit Raw Output:`, textResult);
+         const parsed = JSON.parse(textResult.trim()) as ImageAnalysisReport;
+-        
++
+         return parsed;
+       }
+     } catch (err: any) {
+-      console.warn(`[ImageStudioService] Gemini Vision failed or bypassed, activating smart fallback:`, err.message || err);
++      // INTEGRITY FIX (Phase 2): previously this swallowed the error and returned a
++      // fabricated report. Real failures must now be visible to the caller.
++      console.error(`[ImageStudioService] Gemini Vision image analysis failed:`, err.message || err);
++      throw new Error(`Image analysis failed: ${err.message || "Gemini Vision request did not succeed."}`);
+     }
+-
+-    // High quality customized fallback report based on product title
+-    const score = Math.floor(Math.random() * 15) + 78; // 78 - 92
+-    const readyState: "Excellent" | "Good" | "Needs Improvement" = score > 85 ? "Excellent" : "Good";
+-
+-    return {
+-      qualityScore: score,
+-      marketplaceReadiness: readyState,
+-      brandingReview: `The visual identity for ${productTitle || "your product"} is highly modern, featuring standard lighting, centered composition, and soft tones. Colors are balanced, making the product look premium and premium-tier. Ideal for high-end dropshipping or luxury e-commerce.`,
+-      conversionOptimization: [
+-        "Include a zoom-in callout showcasing the fine material textures and quality finishes.",
+-        "Add a subtle lifestyle contextual element to help customers visualize real-world scale instantly.",
+-        "Insert a clean 'Free Shipping' or warranty badge to increase checkout click-through rates.",
+-        "A/B test a warmer color temperature background to see if engagement rises on social feeds."
+-      ],
+-      seoSuggestions: [
+-        `Rename the image file to '${(productTitle || "product").toLowerCase().replace(/[^a-z0-9]+/g, "-")}-luxury-edition.webp' instead of default names.`,
+-        "Utilize high-relevance visual Alt Tags like 'Premium hand-crafted luxury design accessory on marble backdrop'.",
+-        "Compress the file to WebP format to reduce page load speed below 1.2 seconds for higher Google ranking.",
+-        "Integrate schema.json structured markup referencing this high-resolution visual file."
+-      ],
+-      marketplaceCheck: "Meets 95% of standard marketplace specifications. Background contrast is ideal for Shopify. For Amazon listing requirements, ensure a pure white (#FFFFFF) background and that the product occupies at least 85% of the canvas frame."
+-    };
+   }
+ }

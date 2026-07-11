@@ -1,0 +1,254 @@
+--- original_reference/server/ai/analyzer.ts	2026-07-06 18:23:36.000000000 +0000
++++ audit/server/ai/analyzer.ts	2026-07-09 19:13:43.198218890 +0000
+@@ -33,182 +33,6 @@
+   };
+ }
+ 
+-function buildFallbackAnalysisPayload(product: NormalizedProduct, languageCode: string): AnalyzerPayload {
+-  const specs = Object.entries(product.specifications || {}).map(([key, value]) => `${key}: ${String(value)}`);
+-  const benefitSeed = specs.slice(0, 3);
+-  const visualDirection = product.images
+-    ? ["clean ecommerce photography", "premium close-up product details", "benefit-first comparison layouts"]
+-    : ["typography-led concept boards", "minimal product illustration layouts", "high-contrast benefit callouts"];
+-
+-  return {
+-    rawMetrics: {
+-      searchVolume: Math.max(1200, Math.round((product.price || 25) * 120)),
+-      dailySales: Math.max(8, Math.round((product.variants?.length || 1) * 3)),
+-      socialEngagement: Math.max(90, (product.gallery?.length || 0) * 140 + 120),
+-      competitorsCount: Math.max(6, (product.variants?.length || 0) + 5),
+-      bidCostIndex: 0.42,
+-      brandShareIndex: 0.28,
+-      shortTermGrowthFactor: 0.32,
+-      longTermGrowthFactor: 0.24,
+-      acquisitionCost: Number(((product.price || 25) * 0.42).toFixed(2)),
+-    },
+-    creativeMarketPayload: {
+-      marketIntelligence: {
+-        bestCountries: ["US", "GB", "CA"],
+-        bestAudiences: [
+-          {
+-            personaName: languageCode === "en" ? "Trend-aware premium shopper" : "Premium shopper",
+-            rationale: `${product.title} fits buyers who respond to polished design, clear differentiation, and fast visual proof of value.`,
+-          },
+-        ],
+-        bestAdPlatforms: [
+-          {
+-            platform: "instagram",
+-            format: "reels vertical video",
+-            justification: `The visual nature of ${product.title} makes short-form social placements the fastest path to perceived value.`,
+-          },
+-          {
+-            platform: "tiktok",
+-            format: "creator style demo",
+-            justification: "Problem-solution storytelling can communicate the product benefit quickly and credibly.",
+-          },
+-        ],
+-        suggestedPricing: {
+-          msrp: Number((product.price * 1.1 || 29.99).toFixed(2)),
+-          lowestAestheticBound: Number((product.price * 0.92 || 24.99).toFixed(2)),
+-          premiumVibeBound: Number((product.price * 1.35 || 39.99).toFixed(2)),
+-          currency: product.currency || "USD",
+-        },
+-      },
+-      marketingIntelligence: {
+-        benefits: benefitSeed.length > 0
+-          ? benefitSeed.map((item) => `Turn "${item}" into a visible customer benefit for faster conversion.`)
+-          : [
+-              `Makes ${product.title} feel easier to trust and easier to buy.`,
+-              "Supports a cleaner, more premium ecommerce offer.",
+-              "Gives marketing creative a clearer hero benefit to communicate.",
+-            ],
+-        objections: [
+-          {
+-            objection: `Why should I choose ${product.title} over similar products?`,
+-            refutationAngle: `Lead with premium finish, proof-driven details, and clearer product differentiation from ${product.vendor}.`,
+-          },
+-          {
+-            objection: "Will the quality match the visual promise?",
+-            refutationAngle: "Use close-up imagery, material proof, and concise benefit-led messaging to reinforce trust.",
+-          },
+-        ],
+-        emotionalTriggers: ["confidence", "status uplift", "instant clarity"],
+-        painPoints: [
+-          "Shoppers are overwhelmed by lookalike products.",
+-          "Generic listings fail to show why the product is worth buying now.",
+-        ],
+-        sellingAngles: [
+-          `${product.title} as the polished, premium-choice upgrade`,
+-          `${product.title} as a fast visual win for modern buyers`,
+-        ],
+-      },
+-      brandIntelligence: {
+-        brandVoiceAnalyzer: {
+-          archetype: "Confident specialist",
+-          essence: `${product.vendor || product.title} should sound premium, clear, and conversion-led.`,
+-          differentiators: ["Sharper product positioning", "Premium visual merchandising", "Stronger proof language"],
+-          messagingPillars: ["Trust the finish", "See the value instantly", "Buy the premium version"],
+-          vocabulary: ["premium", "refined", "designed", "detail", "confidence"],
+-          signaturePhrases: [`Upgrade the way you buy ${product.title}.`],
+-          doSay: ["Lead with concrete value", "Use visual proof and concise benefits"],
+-          avoidSay: ["Overhyped claims", "Vague luxury language without proof"],
+-        },
+-        competitorBrandAnalysis: [
+-          {
+-            competitorName: "Generic marketplace sellers",
+-            positioning: "Compete on convenience and generic feature lists",
+-            audience: "Price-first shoppers",
+-            toneOfVoice: "Functional and undifferentiated",
+-            strengths: ["High listing volume", "Aggressive discounting"],
+-            weaknesses: ["Weak brand narrative", "Low emotional differentiation"],
+-            whitespace: "Own premium clarity and better visual trust-building.",
+-          },
+-        ],
+-        brandPositioning: {
+-          category: product.title,
+-          targetAudience: "Modern ecommerce shoppers who respond to premium visual proof",
+-          brandPromise: `A more confident way to buy ${product.title}.`,
+-          valueProposition: `${product.title} combines functional utility with a more premium, trust-building buying experience.`,
+-          differentiators: ["Premium finish", "Clearer benefit framing", "Stronger brand consistency"],
+-          reasonToBelieve: ["Detailed imagery", "Structured offer presentation", "Focused product story"],
+-          marketWhitespace: ["Premium clarity in a crowded category", "A more elevated visual merchandising angle"],
+-          elevatorPitch: `${product.vendor || product.title} helps buyers choose ${product.title} with less friction and more confidence through clearer premium positioning.`,
+-        },
+-        customerPersonaGeneration: [
+-          {
+-            personaName: "Premium conversion shopper",
+-            demographics: "Digitally native buyer aged 24-40",
+-            psychographics: "Values design polish, perceived quality, and fast buying confidence",
+-            coreNeeds: ["Trust the product quickly", "See premium value immediately"],
+-            painPoints: ["Too many generic options", "Weak product storytelling"],
+-            buyingTriggers: ["Strong visuals", "Concise benefit framing", "Premium cues"],
+-            preferredChannels: ["Instagram", "TikTok", "Email"],
+-            preferredContentAngles: ["Before and after value", "Proof-led demos", "Premium product close-ups"],
+-          },
+-        ],
+-        toneOfVoiceAnalysis: {
+-          primaryTone: "premium and direct",
+-          secondaryTones: ["confident", "clear", "modern"],
+-          tonalSliders: [
+-            { dimension: "playful_vs_serious", score: 35, guidance: "Stay polished and concise rather than playful." },
+-            { dimension: "minimal_vs_descriptive", score: 62, guidance: "Use detail where it increases trust." },
+-          ],
+-          writingGuidelines: ["Lead with clarity", "Keep benefits visual", "Avoid cluttered copy"],
+-          avoidedPatterns: ["Overclaiming", "Generic luxury clichés"],
+-        },
+-        brandIdentityGenerator: {
+-          brandName: product.vendor || product.title,
+-          tagline: `Designed to make ${product.title} easier to choose.`,
+-          mission: `Help shoppers buy ${product.title} with more clarity and confidence.`,
+-          vision: "Become the premium benchmark in a crowded category.",
+-          coreValues: ["clarity", "quality", "trust"],
+-          personalityTraits: ["refined", "direct", "credible"],
+-          visualDirection,
+-          colorMood: ["clean neutrals", "premium contrast", "high-clarity product focus"],
+-          typographyStyle: "modern sans-serif with premium editorial contrast",
+-          imageryDirection: "high-detail product photography with elevated ecommerce framing",
+-        },
+-      },
+-      creativeIntelligence: {
+-        hooks: [
+-          `The premium-looking ${product.title} buyers stop scrolling for.`,
+-          `Why generic alternatives keep disappointing shoppers.`,
+-          `A cleaner, sharper way to present ${product.title}.`,
+-        ],
+-        adConcepts: [
+-          {
+-            conceptName: "Premium comparison hook",
+-            hookId: 0,
+-            description: `Open with a refined hero shot of ${product.title}, contrast it against category clutter, then land on a clear premium payoff.`,
+-          },
+-          {
+-            conceptName: "Close-up trust builder",
+-            hookId: 1,
+-            description: "Use tight detail shots, concise overlays, and one strong reason-to-believe to increase purchase confidence.",
+-          },
+-        ],
+-        ugcIdeas: [
+-          `Creator explains why ${product.title} feels like the premium upgrade.`,
+-          `Before-and-after style demo showing a clearer result or experience.`,
+-        ],
+-        videoConcepts: [
+-          {
+-            durationSeconds: 20,
+-            visualFlow: `Start with a polished hero shot of ${product.title}, move into close-up detail, then finish with proof and CTA.`,
+-            audioDialogue: `If you want ${product.title} to feel like a premium choice, this is the version to watch.`,
+-          },
+-        ],
+-      },
+-    },
+-  };
+-}
+-
+ function asString(value: unknown): string {
+   return typeof value === "string" ? value.trim() : "";
+ }
+@@ -387,7 +211,7 @@
+     const db = await DatabaseManager.getInstance();
+ 
+     // 1. Verify credits before starting
+-    const hasSufficientCredits = db.checkCreditBalance(workspaceId, 20);
++    const hasSufficientCredits = await db.checkCreditBalance(workspaceId, 20);
+     if (!hasSufficientCredits) {
+       throw new Error("INSUFFICIENT_CREDITS: You need at least 20 credits to run an analysis.");
+     }
+@@ -563,6 +387,11 @@
+ 
+     const schemaDescription = "A JSON object matching the requested structure with rawMetrics and creativeMarketPayload.";
+ 
++    // INTEGRITY FIX (Phase 2): this previously caught any AI provider failure and silently
++    // substituted a fully fabricated market-intelligence payload (buildFallbackAnalysisPayload),
++    // while still tagging the response `provider: "gemini"` - making fabricated data
++    // indistinguishable from a real Gemini response anywhere in the UI. Product analysis must
++    // now fail honestly when no configured AI provider can service the request.
+     // 2. Query AI Provider Layer (Primary DeepSeek, falling back to Gemini then OpenAI)
+     let providerRes;
+     try {
+@@ -576,14 +405,12 @@
+         } // slightly lower temperature for strict JSON conformity
+       );
+     } catch (err: any) {
+-      console.warn("[Product Intelligence Engine] Falling back to local heuristic analysis:", err);
+-      providerRes = {
+-        rawContent: JSON.stringify(buildFallbackAnalysisPayload(product, languageCode)),
+-        provider: "gemini",
+-        modelUsed: "sandbox-heuristic-analysis",
+-        tokensConsumed: undefined,
+-        latencyMs: 0,
+-      };
++      console.error("[Product Intelligence Engine] All configured AI providers failed:", err?.message || err);
++      throw new Error(
++        `Product analysis failed: no configured AI provider (DeepSeek, Gemini, or OpenAI) could complete the ` +
++        `request. ${err?.message ? `Underlying error: ${err.message}` : ""} Please verify your AI Provider ` +
++        `API keys in Settings and try again.`
++      );
+     }
+ 
+     // 3. Clear fences and parse safely using our parser
+@@ -722,7 +549,7 @@
+     const confidenceScore = Number(calculatedConfidence.toFixed(3));
+ 
+     // 7. Persist analysis database transactions safely
+-    const savedAnalysis = db.saveProductAnalysis({
++    const savedAnalysis = await db.saveProductAnalysis({
+       productId: product.id || "",
+       workspaceId,
+       languageCode,
+@@ -746,7 +573,7 @@
+     });
+ 
+     // 8. Charge credits transactional safely on the DB ledger
+-    const successCharge = db.chargeCreditsForAnalysis(
++    const successCharge = await db.chargeCreditsForAnalysis(
+       workspaceId,
+       product.id || "",
+       `Ran intelligence analysis (v${savedAnalysis.version}) for product ("${product.title}").`
+@@ -754,7 +581,7 @@
+ 
+     if (!successCharge) {
+       // Clean up newly created analysis if credit race condition somehow occurs
+-      db.completeImportFailure(savedAnalysis.id, workspaceId, "Insufficient credits during write lock commit.");
++      await db.completeImportFailure(savedAnalysis.id, workspaceId, "Insufficient credits during write lock commit.");
+       throw new Error("Credit charge failed during transaction write lock: insufficient workspace credits.");
+     }
+ 

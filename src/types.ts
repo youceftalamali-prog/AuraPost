@@ -91,11 +91,16 @@ export interface WorkspaceSubscription {
   plan: SubscriptionPlanName;
   status: SubscriptionStatus;
   billingInterval: SubscriptionInterval;
+  paymentProvider: "paypal" | "stripe";
   stripeCustomerId?: string;
   stripeSubscriptionId?: string;
   stripePortalUrl?: string;
   stripeCheckoutSessionId?: string;
   stripeMode: "sandbox" | "live";
+  paypalSubscriptionId?: string;
+  paypalPlanId?: string;
+  paypalPayerId?: string;
+  paypalMode: "sandbox" | "live";
   trialEndsAt?: string;
   currentPeriodStart: string;
   currentPeriodEnd: string;
@@ -109,7 +114,10 @@ export interface BillingInvoice {
   id: string;
   workspaceId: string;
   subscriptionId?: string;
+  paymentProvider?: "paypal" | "stripe";
   stripeInvoiceId?: string;
+  paypalOrderId?: string;
+  paypalCaptureId?: string;
   amountPaid: number;
   currency: string;
   status: "draft" | "open" | "paid" | "void" | "uncollectible";
@@ -122,7 +130,10 @@ export interface PaymentHistoryItem {
   id: string;
   workspaceId: string;
   invoiceId?: string;
+  paymentProvider?: "paypal" | "stripe";
   stripePaymentIntentId?: string;
+  paypalOrderId?: string;
+  paypalCaptureId?: string;
   amount: number;
   currency: string;
   status: "pending" | "paid" | "failed" | "refunded";
@@ -845,6 +856,18 @@ export interface OpportunityAnalyticsItem {
 export interface AdvancedAnalyticsPayload {
   dateRange: AnalyticsDateRange;
   selectedProductId?: string;
+  /**
+   * INTEGRITY FIX (Phase 2): revenue, sales, traffic, conversions, ROI, and engagement
+   * figures require a connected real order/traffic data source (e.g. Shopify Orders API,
+   * an ad platform Insights API, or Google Analytics). None of these are connected yet in
+   * this build, so those fields are reported as 0/unavailable rather than estimated or
+   * fabricated. This field explains that plainly so the UI can disclose it to the user.
+   */
+  analyticsDataDisclosure: {
+    ordersDataConnected: boolean;
+    trafficDataConnected: boolean;
+    message: string;
+  };
   kpis: AnalyticsKpi[];
   revenueTrend: AnalyticsTimeseriesPoint[];
   topProducts: ProductPerformanceItem[];

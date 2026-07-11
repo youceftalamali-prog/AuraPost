@@ -1,0 +1,23 @@
+--- original_reference/server/encryption.ts	2026-07-06 18:23:36.000000000 +0000
++++ audit/server/encryption.ts	2026-07-06 21:11:52.327410303 +0000
+@@ -11,9 +11,17 @@
+   if (cachedKey) {
+     return cachedKey;
+   }
+-  const masterKey = process.env.ENCRYPTION_MASTER_KEY || "aurapost-dev-default-encryption-key-do-not-use-in-prod";
+-  if (!process.env.ENCRYPTION_MASTER_KEY) {
+-    console.warn("⚠️ WARNING: ENCRYPTION_MASTER_KEY environment variable is missing. Using development fallback key. DO NOT USE THIS IN PRODUCTION!");
++  // SECURITY FIX (Phase 1 — Critical Issue #6): hardcoded default encryption key removed.
++  // This key protects every stored third-party API key (OpenAI, Gemini, Flux, etc). Booting
++  // with a publicly-known default means all encrypted secrets in the database can be trivially
++  // decrypted by anyone with source code access. We now fail fast instead of running insecurely.
++  const masterKey = process.env.ENCRYPTION_MASTER_KEY;
++  if (!masterKey || masterKey.length < 16) {
++    throw new Error(
++      "FATAL: ENCRYPTION_MASTER_KEY environment variable must be set to a strong value " +
++      "(at least 16 characters, ideally 32+ random bytes). Refusing to start with an " +
++      "insecure default key. Generate one with `openssl rand -base64 32`."
++    );
+   }
+   cachedKey = crypto.createHash(KEY_DERIVATION).update(masterKey).digest();
+   return cachedKey;
